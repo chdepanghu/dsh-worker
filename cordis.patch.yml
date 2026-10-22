@@ -1,0 +1,13 @@
+# 需求开发工作台：把本包的服务端入口插入 Harness 插件树。
+# 业务数据（工作台设置）写在 DSH 数据目录下的 requirement-dev-workbench/。
+- insert:
+    - id: requirement-dev-workbench
+      name: dsh-requirement-dev-workbench
+      config:
+        root: !!js dshHomePath('requirement-dev-workbench')
+        # lark-cli 可执行文件；留空则自动在 PATH 里查找 lark-cli
+        larkCli: ''
+        # 读飞书多维表格时使用的身份：user / bot
+        identity: 'user'
+        # 额外的技能根目录（可选，逗号分隔不生效，这里是数组）；留空则只扫描全局与所选项目
+        skillsRoots: []

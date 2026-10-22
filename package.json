@@ -1,0 +1,56 @@
+{
+  "name": "dsh-requirement-dev-workbench",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "需求开发工作台：读取飞书多维表格里的开发需求，选中本地项目后一键生成开发指令，并可浏览项目/全局 skill 与开发规范。",
+  "license": "MIT",
+  "author": "EDY",
+  "main": "dsh/index.js",
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  },
+  "exports": {
+    ".": "./dsh/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "dsh-desktop-workbenches"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0",
+    "@deepseek-ai/schemastery": ">=3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
+  "files": [
+    "dsh",
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-workbench",
+    "requirement",
+    "feishu",
+    "lark"
+  ]
+}
