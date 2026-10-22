@@ -10,7 +10,8 @@
  * 不持有任何凭证：一律调用用户本机已登录的 lark-cli。
  */
 import { spawn } from 'node:child_process'
-import { readFile, mkdir, readdir, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { readFile, mkdir, readdir, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 
@@ -79,15 +80,33 @@ async function resolveLarkCli(configured) {
   if (configured) return configured
   if (process.platform === 'win32') {
     const probe = await runCommand('where.exe', ['lark-cli'], { timeoutMs: 10_000 })
-    const first = probe.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean)
-    if (first) return first
+    const lines = probe.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+    // where.exe 会同时列出一个没有扩展名的 shell 垫片（spawn 不了），优先可执行的扩展名。
+    const ranked = [...lines].sort((a, b) => extensionRank(a) - extensionRank(b))
+    for (const candidate of ranked) {
+      if (extensionRank(candidate) < 9) return candidate
+      for (const ext of ['.cmd', '.exe', '.bat', '.ps1']) {
+        const withExt = `${candidate}${ext}`
+        if (existsSync(withExt)) return withExt
+      }
+    }
+    if (lines[0]) return lines[0]
   }
   return 'lark-cli'
+}
+
+/** 越小越优先：真正的可执行入口排在没有扩展名的垫片前面。 */
+function extensionRank(file) {
+  const lower = String(file).toLowerCase()
+  if (lower.endsWith('.cmd') || lower.endsWith('.exe') || lower.endsWith('.bat')) return 0
+  if (lower.endsWith('.ps1')) return 1
+  return 9
 }
 
 /* ----------------------------------------------------------------- 设置 */
 
 const DEFAULT_SETTINGS = {
+  sourceName: '',
   baseToken: '',
   tableId: '',
   viewId: '',
@@ -130,20 +149,22 @@ async function writeSettings(config, patch) {
 
 /* ------------------------------------------------------------- 飞书需求 */
 
-/** 从粘贴的飞书链接里抽出 base_token（/base/<token>）或 wiki 节点 token。 */
+/** 从粘贴的飞书链接里抽出 base_token（/base/<token>）、table_id 与 view_id。 */
 export function parseBaseInput(input) {
   const text = String(input ?? '').trim()
-  if (!text) return { baseToken: '', tableId: '' }
+  if (!text) return { baseToken: '', tableId: '', viewId: '' }
   if (/^https?:/i.test(text)) {
     const base = /\/base\/([A-Za-z0-9]+)/.exec(text)
     const table = /[?&]table=([^&#]+)/.exec(text)
+    const view = /[?&]view=([^&#]+)/.exec(text)
     return {
       baseToken: base ? base[1] : '',
       tableId: table ? decodeURIComponent(table[1]) : '',
+      viewId: view ? decodeURIComponent(view[1]) : '',
     }
   }
   const parts = text.split(/[\s,|]+/).filter(Boolean)
-  return { baseToken: parts[0] ?? '', tableId: parts[1] ?? '' }
+  return { baseToken: parts[0] ?? '', tableId: parts[1] ?? '', viewId: '' }
 }
 
 function pickField(fields, explicit, hints) {
@@ -216,65 +237,202 @@ export function parseLarkRecords(stdout) {
   return rows
 }
 
-export function normalizeRecord(record, settings) {
+export function normalizeRecord(record, settings, fieldMap) {
   const fields = record?.fields && typeof record.fields === 'object' ? record.fields : record ?? {}
   const names = Object.keys(fields)
-  const titleKey = pickField(fields, settings.titleField, ['标题', '名称', '需求', 'title', 'name'])
-  const statusKey = pickField(fields, settings.statusField, ['状态', 'status', '进度'])
-  const projectKey = pickField(fields, settings.projectField, ['项目', '仓库', 'project', 'repo'])
-  const ownerKey = pickField(fields, settings.ownerField, ['负责人', '指派', 'owner', 'assignee', '处理人'])
-  const title = toPlain(fields[titleKey]) || toPlain(fields[names[0]]) || '（无标题记录）'
+  const mapped = (logical) => {
+    const actual = fieldMap?.[logical]
+    return actual && actual in fields ? toPlain(fields[actual]) : ''
+  }
+  const titleKey = pickField(fields, settings?.titleField, ['需求标题', '标题', '名称', 'title', 'name'])
+  const statusKey = pickField(fields, settings?.statusField, ['状态', 'status', '进度'])
+  const projectKey = pickField(fields, settings?.projectField, ['所属项目', '项目', '仓库', 'project', 'repo'])
+  const ownerKey = pickField(fields, settings?.ownerField, ['负责人', '指派', 'owner', 'assignee', '处理人'])
+  const title = mapped('title') || toPlain(fields[titleKey]) || toPlain(fields[names[0]]) || '（无标题记录）'
   return {
-    id: String(record?.record_id ?? record?.recordId ?? record?.id ?? ''),
+    id: String(record?.record_id ?? record?.recordId ?? record?.id ?? mapped('id') ?? ''),
     title,
-    status: toPlain(fields[statusKey]),
-    project: toPlain(fields[projectKey]),
-    owner: toPlain(fields[ownerKey]),
+    status: mapped('status') || toPlain(fields[statusKey]),
+    project: mapped('project') || toPlain(fields[projectKey]),
+    owner: mapped('owner') || toPlain(fields[ownerKey]),
+    code: mapped('id'),
+    rawRequirement: mapped('rawRequirement'),
+    design: mapped('design'),
+    designLink: mapped('designLink'),
+    devSupplement: mapped('devSupplement'),
+    acceptance: mapped('acceptance'),
+    priority: mapped('priority'),
+    type: mapped('type'),
+    prompt: mapped('prompt'),
     fieldNames: names,
     fields: Object.fromEntries(names.map((key) => [key, toPlain(fields[key])])),
   }
 }
 
+/* ---------------------------------------------- 需求源（复用项目内配置） */
+
+const SOURCE_CONFIG_FILES = ['.requirement-sources.json', join('doc', 'requirement-sources.json')]
+
+/** 读项目里已有的需求源配置（就是 feishu-requirement-intake 用的那一份）。 */
+export async function loadRequirementSources(projectDir) {
+  if (!projectDir) return null
+  for (const rel of SOURCE_CONFIG_FILES) {
+    const file = join(projectDir, rel)
+    const text = await readFile(file, 'utf8').catch(() => null)
+    if (text === null) continue
+    let parsed
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      continue
+    }
+    const raw = parsed?.sources && typeof parsed.sources === 'object' ? parsed.sources : {}
+    const names = Object.keys(raw)
+    if (!names.length) continue
+    return {
+      path: file,
+      defaultSource: parsed.defaultSource && raw[parsed.defaultSource] ? parsed.defaultSource : names[0],
+      sources: names.map((name) => ({ name, ...raw[name] })),
+    }
+  }
+  return null
+}
+
+/** 决定这次读哪张表：优先项目里已有的需求源配置，其次工作台设置里手填的。 */
+export async function resolveRequirementsSource(config, settings) {
+  const detected = await loadRequirementSources(settings.projectDir)
+  const wanted = settings.sourceName || detected?.defaultSource || ''
+  const chosen = detected?.sources?.find((source) => source.name === wanted) ?? null
+  const fromUrl = parseBaseInput(chosen?.baseUrl ?? '')
+  const baseToken = fromUrl.baseToken || settings.baseToken
+  const tableId = fromUrl.tableId || settings.tableId || chosen?.tableName || ''
+  return {
+    label: chosen ? chosen.name : '手动填写',
+    sourceName: chosen ? chosen.name : '',
+    configPath: detected?.path ?? '',
+    baseToken,
+    tableId,
+    viewId: fromUrl.viewId || chosen?.viewId || settings.viewId,
+    fieldMap: chosen?.fields ?? null,
+    filter: chosen?.filter ?? null,
+    identity: chosen?.identity || config.identity || 'user',
+    configured: Boolean(baseToken && tableId),
+  }
+}
+
+function publicSource(source) {
+  return {
+    label: source.label,
+    sourceName: source.sourceName,
+    configPath: source.configPath,
+    tableId: source.tableId,
+    viewId: source.viewId,
+    identity: source.identity,
+    filter: source.filter,
+    fieldMap: source.fieldMap,
+  }
+}
+
+/** json matrix（值矩阵）兜底：列名取自 +field-list，列数不一致就不猜。 */
+async function matrixToRecords(wrapper, source, stdout) {
+  let parsed
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    return []
+  }
+  const rows = parsed?.data?.data
+  if (!Array.isArray(rows) || !rows.length) return extractRecords(parsed)
+  if (rows.every((row) => !Array.isArray(row))) return extractRecords(parsed)
+  const listed = await runCommand(wrapper.file, [
+    ...wrapper.args,
+    'base',
+    '+field-list',
+    '--base-token',
+    source.baseToken,
+    '--table-id',
+    source.tableId,
+    '--as',
+    source.identity,
+    '--format',
+    'json',
+  ])
+  let names = []
+  try {
+    names = (JSON.parse(listed.stdout)?.data?.fields ?? []).map((field) => field.name)
+  } catch {
+    names = []
+  }
+  if (!names.length || names.length !== rows[0].length) return []
+  return rows.map((row) => ({
+    record_id: '',
+    fields: Object.fromEntries(names.map((name, index) => [name, row[index]])),
+  }))
+}
+
+function describeRead(source) {
+  return `lark-cli base +record-list --base-token ${source.baseToken} --table-id ${source.tableId} --as ${source.identity}`
+}
+
 async function fetchRequirements(config, settings) {
-  if (!settings.baseToken || !settings.tableId) {
-    return { configured: false, items: [], message: '还没有配置飞书多维表格' }
+  const source = await resolveRequirementsSource(config, settings)
+  if (!source.configured) {
+    return { configured: false, items: [], source: publicSource(source), message: '还没有配置飞书多维表格（可以选项目里已有的需求源，或手动粘贴链接）' }
   }
   const larkCli = await resolveLarkCli(config.larkCli)
   const wrapper = shellWrapper(larkCli)
-  const args = [
-    ...wrapper.args,
+  const common = [
     'base',
     '+record-list',
     '--base-token',
-    settings.baseToken,
+    source.baseToken,
     '--table-id',
-    settings.tableId,
+    source.tableId,
     '--as',
-    config.identity || 'user',
-    '--format',
-    'json',
+    source.identity,
   ]
-  if (settings.viewId) args.push('--view-id', settings.viewId)
-  const result = await runCommand(wrapper.file, args)
-  if (!result.ok) {
-    return {
-      configured: true,
-      items: [],
-      error: '读取飞书多维表格失败',
-      detail: (result.stderr || result.stdout || '').trim().slice(0, 1500),
-      command: `lark-cli base +record-list --base-token ${settings.baseToken} --table-id ${settings.tableId} --as ${config.identity || 'user'} --format json`,
+  if (source.viewId) common.push('--view-id', source.viewId)
+
+  const pullDir = join(config.root, 'pull')
+  await mkdir(pullDir, { recursive: true })
+  const outFile = join(pullDir, `${String(source.tableId).replace(/[^\w.-]/g, '_') || 'records'}.ndjson`)
+
+  const ndjson = await runCommand(wrapper.file, [...wrapper.args, ...common, '--limit', '2000', '--format', 'ndjson', '--output', outFile, '--overwrite'])
+  let records = []
+  let fetchMode = 'ndjson'
+  let warning = ''
+  if (ndjson.ok) {
+    const text = await readFile(outFile, 'utf8').catch(() => '')
+    records = parseLarkRecords(text)
+    await rm(outFile, { force: true }).catch(() => {})
+  } else {
+    fetchMode = 'json'
+    const json = await runCommand(wrapper.file, [...wrapper.args, ...common, '--limit', '200', '--format', 'json'])
+    if (!json.ok) {
+      return {
+        configured: true,
+        items: [],
+        source: publicSource(source),
+        error: '读取飞书多维表格失败',
+        detail: (json.stderr || json.stdout || ndjson.stderr || '').trim().slice(0, 1500),
+        command: describeRead(source),
+      }
     }
+    records = await matrixToRecords(wrapper, source, json.stdout)
+    if (!records.length) warning = '表格返回的是值矩阵，但没有拿到可对齐的列名，请把字段名补进需求源配置。'
   }
-  const items = parseLarkRecords(result.stdout).map((record) => normalizeRecord(record, settings))
-  return { configured: true, items, count: items.length }
+
+  const items = records.map((record) => normalizeRecord(record, settings, source.fieldMap))
+  return { configured: true, items, count: items.length, source: publicSource(source), fetchMode, warning }
 }
 
 async function updateRequirementStatus(config, settings, body) {
-  if (!settings.baseToken || !settings.tableId) return { ok: false, error: '还未配置飞书多维表格' }
+  const source = await resolveRequirementsSource(config, settings)
+  if (!source.configured) return { ok: false, error: '还未配置飞书多维表格' }
   const recordId = String(body?.recordId ?? '').trim()
   const status = String(body?.status ?? '').trim()
   if (!recordId || !status) return { ok: false, error: '缺少记录 ID 或状态值' }
-  const statusField = settings.statusField || '状态'
+  const statusField = settings.statusField || source.fieldMap?.status || '状态'
   const larkCli = await resolveLarkCli(config.larkCli)
   const wrapper = shellWrapper(larkCli)
   const args = [
@@ -282,15 +440,15 @@ async function updateRequirementStatus(config, settings, body) {
     'base',
     '+record-update',
     '--base-token',
-    settings.baseToken,
+    source.baseToken,
     '--table-id',
-    settings.tableId,
+    source.tableId,
     '--record-id',
     recordId,
     '--fields-json',
     JSON.stringify({ [statusField]: status }),
     '--as',
-    config.identity || 'user',
+    source.identity,
   ]
   const result = await runCommand(wrapper.file, args)
   if (!result.ok) {
@@ -301,7 +459,7 @@ async function updateRequirementStatus(config, settings, body) {
       hint: `按本机 lark-cli 的实际参数名调整（当前用 --fields-json，字段名「${statusField}」）`,
     }
   }
-  return { ok: true }
+  return { ok: true, field: statusField, status }
 }
 
 /* ------------------------------------------------------------ 技能/规范 */
@@ -450,11 +608,13 @@ export function apply(ctx, config) {
       if (route === '/state' && req.method === 'GET') {
         const settings = await readSettings(config)
         const larkCli = await resolveLarkCli(config.larkCli)
+        const resolved = await resolveRequirementsSource(config, settings)
         return sendJson(res, 200, {
           settings,
           larkCli,
           identity: config.identity || 'user',
-          configured: Boolean(settings.baseToken && settings.tableId),
+          configured: resolved.configured,
+          source: publicSource(resolved),
         })
       }
 
@@ -469,6 +629,26 @@ export function apply(ctx, config) {
         delete next.baseInput
         const settings = await writeSettings(config, next)
         return sendJson(res, 200, { settings })
+      }
+
+      if (route === '/sources' && req.method === 'GET') {
+        const settings = await readSettings(config)
+        const detected = await loadRequirementSources(settings.projectDir)
+        const names = (detected?.sources ?? []).map((item) => item.name)
+        return sendJson(res, 200, {
+          found: Boolean(detected),
+          path: detected?.path ?? '',
+          defaultSource: detected?.defaultSource ?? '',
+          selected: names.includes(settings.sourceName) ? settings.sourceName : detected?.defaultSource ?? '',
+          sources: (detected?.sources ?? []).map((item) => ({
+            name: item.name,
+            tableName: item.tableName ?? '',
+            baseUrl: item.baseUrl ?? '',
+            identity: item.identity ?? '',
+            fields: item.fields ?? null,
+            filter: item.filter ?? null,
+          })),
+        })
       }
 
       if (route === '/requirements' && req.method === 'GET') {

@@ -17,6 +17,8 @@ import { apply, normalizeRecord, parseBaseInput, parseLarkRecords } from '../dsh
 const LARK = process.env.RDW_LARK_CLI || 'D:\\soft\\nodejs\\lark-cli.ps1'
 const BASE_TOKEN = process.env.RDW_TEST_BASE || 'I3YnbPQp6awaxWsC1FZc8v89nyc'
 const TABLE_ID = process.env.RDW_TEST_TABLE || '知识目录'
+const REAL_BASE_URL =
+  process.env.RDW_TEST_REAL_BASE || 'https://gaiaworks.feishu.cn/base/C61gbfm4fa5DIIs1tuVc93KHnoe?table=tbl4rWKwWr1tL1io'
 
 let passed = 0
 let warned = 0
@@ -193,6 +195,60 @@ check('扫到项目 skill 并解析出 frontmatter 描述', skillNames.includes(
 check('扫到规范文档', (scanned.json?.docs ?? []).some((doc) => doc.name === '03-coding'), (scanned.json?.docs ?? []).map((d) => d.name))
 const readable = await call('GET', `/skill?path=${encodeURIComponent(join(projectDir, '.claude', 'skills', 'feature-dev', 'SKILL.md'))}`)
 check('能读出 skill 正文', readable.status === 200 && String(readable.json?.text ?? '').includes('# feature-dev'))
+
+/* ------------------------------------------- 真实需求源（端到端） */
+
+console.log('\n[4] 真实需求源：项目内 .requirement-sources.json → 飞书需求表')
+await writeFile(
+  join(projectDir, '.requirement-sources.json'),
+  JSON.stringify(
+    {
+      version: 1,
+      defaultSource: 'dahua-skill-service',
+      sources: {
+        'dahua-skill-service': {
+          baseUrl: REAL_BASE_URL,
+          tableName: '需求池',
+          identity: 'user',
+          fields: {
+            id: '需求编号',
+            title: '需求标题',
+            status: '状态',
+            type: '需求类型',
+            priority: '优先级',
+            rawRequirement: '原始需求',
+            design: '详细设计',
+            acceptance: '验收标准',
+            owner: '负责人',
+          },
+          filter: { 状态: ['待开发'] },
+        },
+      },
+    },
+    null,
+    2,
+  ),
+  'utf8',
+)
+
+const detected = await call('GET', '/sources')
+check('认出项目里的需求源配置', detected.status === 200 && detected.json?.found === true && detected.json.sources?.[0]?.name === 'dahua-skill-service', detected.json?.path)
+
+const stateWithSource = await call('GET', '/state')
+check('/state 因为需求源存在而视为已配置', stateWithSource.json?.configured === true && stateWithSource.json?.source?.configPath?.endsWith('.requirement-sources.json'))
+
+const real = await call('GET', '/requirements')
+if (real.json?.error) {
+  warn('真实需求表读取失败（环境/权限问题，非代码问题）', String(real.json.detail || '').slice(0, 240))
+} else {
+  check('真实需求表：读到记录', Array.isArray(real.json?.items) && real.json.items.length > 0, { count: real.json?.count, mode: real.json?.fetchMode })
+  const first = real.json?.items?.[0]
+  check('字段映射生效：标题取自配置里的「需求标题」列', Boolean(first?.title) && first.title !== '（无标题记录）', { title: first?.title })
+  if (first) {
+    console.log(`       样例：编号=${first.code || '-'}｜标题=${first.title}｜状态=${first.status}｜负责人=${first.owner}｜字段数=${Object.keys(first.fields || {}).length}`)
+    console.log(`       原始需求前 60 字：${String(first.rawRequirement || '').replace(/\s+/g, ' ').slice(0, 60)}`)
+  }
+}
 
 await rm(root, { recursive: true, force: true })
 

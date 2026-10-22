@@ -1,6 +1,6 @@
 {
   "name": "dsh-requirement-dev-workbench",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "需求开发工作台：读取飞书多维表格里的开发需求，选中本地项目后一键生成开发指令，并可浏览项目/全局 skill 与开发规范。",
