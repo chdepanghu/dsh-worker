@@ -19,6 +19,8 @@ const BASE_TOKEN = process.env.RDW_TEST_BASE || 'I3YnbPQp6awaxWsC1FZc8v89nyc'
 const TABLE_ID = process.env.RDW_TEST_TABLE || '知识目录'
 const REAL_BASE_URL =
   process.env.RDW_TEST_REAL_BASE || 'https://gaiaworks.feishu.cn/base/C61gbfm4fa5DIIs1tuVc93KHnoe?table=tbl4rWKwWr1tL1io'
+const REAL_TASK_URL =
+  process.env.RDW_TEST_TASK_BASE || 'https://gaiaworks.feishu.cn/base/C61gbfm4fa5DIIs1tuVc93KHnoe?table=tbluJCHiLRNUpTYl'
 
 let passed = 0
 let warned = 0
@@ -309,6 +311,227 @@ const clientSource = await readClient(new URL('../lib/client.js', import.meta.ur
 check('客户端包含卡片看板与汇总清单', clientSource.includes('卡片看板') && clientSource.includes('汇总清单') && clientSource.includes('复制清单'))
 check('客户端支持拖拽（卡片 + 模块）', clientSource.includes("type: 'card'") && clientSource.includes("type: 'module'") && clientSource.includes('onDragStart'))
 check('客户端按容器宽度重排（ResizeObserver）', clientSource.includes('ResizeObserver'))
+check('客户端有总览 / 执行记录 / 添加模块 / 进度视图', clientSource.includes('工作台执行记录') && clientSource.includes('添加模块') && clientSource.includes("setMode('progress')"))
+
+/* --------------------------- 客户端真的能加载：桩 React 直接执行组件函数体 */
+
+console.log('\n[6b] 客户端加载与组件函数体（无浏览器，用桩 React 跑一遍）')
+const stubReact = {
+  createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat().filter((child) => child !== null && child !== undefined && child !== false) }),
+  useEffect: () => {},
+  useMemo: (factory) => factory(),
+  useCallback: (fn) => fn,
+  useRef: (initial) => ({ current: initial }),
+}
+// 组件用的是工厂里解构出来的同一个 useState 函数，所以状态要按「调用序号」注入，就得读外部可变变量。
+let injectedStates = null
+let stateCursor = 0
+stubReact.useState = (initial) => {
+  const position = stateCursor++
+  if (injectedStates && position in injectedStates) return [injectedStates[position], () => {}]
+  return [typeof initial === 'function' ? initial() : initial, () => {}]
+}
+let clientModule = null
+globalThis.window = { __ModuleLoader__: { load: (definition) => { clientModule = definition.factory((name) => (name === 'react' ? stubReact : undefined)) } } }
+new Function('window', clientSource)(globalThis.window)
+check('客户端能加载并向宿主注册', Boolean(clientModule?.apply) && Array.isArray(clientModule?.inject) && clientModule.inject.includes('desktopWorkbenches'))
+
+const pure = clientModule?.__pure ?? {}
+const components = clientModule?.__components ?? {}
+const sampleItem = {
+  id: 'rec1',
+  title: '技能标签支持 Excel 批量导入',
+  code: 'PR-1',
+  status: '待开发',
+  owner: '陈辉',
+  priority: 'P0',
+  type: '新功能',
+  rawRequirement: '优化导入性能',
+  fields: { 状态: '待开发', 需求标题: '技能标签支持 Excel 批量导入', 原始需求: '优化导入性能', 优先级: 'P0' },
+  fieldNames: ['状态', '需求标题', '原始需求', '优先级'],
+}
+const sampleTable = { key: 'requirement:dahua-skill-service', label: '开发需求 · dahua-skill-service', tableName: '需求池', kind: 'requirement', configPath: 'D:\\p\\.requirement-sources.json', fieldMap: null }
+const sampleView = pure.sliceForTable ? pure.sliceForTable({ modules: [], tables: {} }, sampleTable.key) : {}
+const sampleSchema = [
+  { name: '状态', options: ['待开发', '已完成'] },
+  { name: '需求标题' },
+  { name: '原始需求' },
+]
+
+const renderComponent = (name, props, label) => {
+  const component = components[name]
+  const title = label ?? name
+  if (typeof component !== 'function') {
+    check(`组件可渲染：${title}`, false, '组件未导出')
+    return null
+  }
+  try {
+    const out = component(props)
+    check(`组件可渲染：${title}`, Boolean(out && out.type), out?.type)
+    return out
+  } catch (error) {
+    check(`组件可渲染：${title}`, false, error.message)
+    return null
+  }
+}
+
+const tableNode = renderComponent('TableModule', {
+  state: { configured: true, settings: { projectDir: 'D:\\workspace\\dahua-skill\\dahua-skill-service' }, larkCli: 'lark-cli.cmd' },
+  reloadState: () => {},
+  uiWorkspace: {},
+  table: sampleTable,
+  view: sampleView,
+  saveView: () => {},
+  runs: [{ id: 'run1', at: '2026-10-22T10:00:00.000Z', title: 'T', status: 'done', tableKey: sampleTable.key, recordId: 'rec1' }],
+  handOff: () => {},
+  onUpdateRun: () => {},
+})
+renderComponent('OverviewModule', {
+  overview: {
+    tables: [
+      {
+        key: sampleTable.key,
+        label: sampleTable.label,
+        tableName: '需求池',
+        total: 3,
+        progress: { field: '状态', total: 3, done: 1, active: 1, todo: 1, percent: 33, buckets: [{ value: '待开发', count: 2 }, { value: '已完成', count: 1 }] },
+        sample: [{ id: 'rec1', title: sampleItem.title, status: '待开发', owner: '陈辉' }],
+      },
+      { key: 'task:x', label: '开发任务 · x', kind: 'task', error: '读取飞书多维表格失败', detail: 'boom' },
+    ],
+  },
+  loading: false,
+  runs: [{ id: 'run1', at: '2026-10-22T10:00:00.000Z', title: sampleItem.title, status: 'handed-off', tableKey: sampleTable.key, projectDir: 'D:\\workspace\\dahua-skill\\dahua-skill-service', note: '已复制开发指令' }],
+  onRefresh: () => {},
+  onOpenTable: () => {},
+  onUpdateRun: () => {},
+  onAddModule: () => {},
+  projectDir: 'D:\\workspace\\dahua-skill\\dahua-skill-service',
+})
+renderComponent('ModuleDialog', {
+  tables: [sampleTable],
+  modules: [{ key: 'k1', tableKey: sampleTable.key, title: '开发需求（进度）', view: 'progress' }],
+  onAdd: () => {},
+  onRemove: () => {},
+  onClose: () => {},
+})
+renderComponent('DetailView', {
+  item: sampleItem,
+  settings: { projectDir: 'D:\\p' },
+  runs: [{ id: 'run1', at: '2026-10-22T10:00:00.000Z', title: 'T', status: 'done' }],
+  instruction: '',
+  copyInstruction: () => {},
+  writeBack: () => {},
+  chooseDirectory: () => {},
+  onUpdateRun: () => {},
+  onClose: () => {},
+})
+renderComponent('ViewConfigPanel', {
+  schema: sampleSchema,
+  optionFields: [sampleSchema[0]],
+  textFields: [sampleSchema[1], sampleSchema[2]],
+  view: sampleView,
+  modules: [],
+  onSave: () => {},
+  onClose: () => {},
+})
+renderComponent('BusinessPanel', { service: {}, entry: {} })
+
+/* --------- 让数据/视图分支也真的跑一遍（按 useState 调用序号注入状态） */
+
+const withInjectedState = (overrides, run) => {
+  injectedStates = overrides
+  stateCursor = 0
+  try {
+    return run()
+  } finally {
+    injectedStates = null
+    stateCursor = 0
+  }
+}
+
+/** 把渲染树里的文字全抓出来，方便断言。 */
+const collectText = (node, out = []) => {
+  if (node === null || node === undefined || node === false || node === true) return out
+  if (typeof node === 'string' || typeof node === 'number') {
+    out.push(String(node))
+    return out
+  }
+  for (const child of node.children ?? []) collectText(child, out)
+  return out
+}
+
+const collectByType = (node, type, out = []) => {
+  if (!node || typeof node !== 'object') return out
+  if (node.type === type) out.push(node)
+  for (const child of node.children ?? []) collectByType(child, type, out)
+  return out
+}
+
+const secondItem = { ...sampleItem, id: 'rec2', title: '薪资标准对比导出', status: '已完成', fields: { ...sampleItem.fields, 状态: '已完成', 需求标题: '薪资标准对比导出' } }
+const tableData = { configured: true, items: [sampleItem, secondItem], count: 2, source: { label: '开发需求 · dahua-skill-service', tableName: '需求池', configPath: 'x' } }
+const schemaResult = { configured: true, fields: sampleSchema }
+const tableProps = {
+  state: { configured: true, settings: { projectDir: 'D:\\workspace\\dahua-skill\\dahua-skill-service' }, larkCli: 'lark-cli.cmd' },
+  reloadState: () => {},
+  uiWorkspace: {},
+  table: sampleTable,
+  view: { ...sampleView, groupField: '状态' },
+  saveView: () => {},
+  runs: [{ id: 'run1', at: '2026-10-22T10:00:00.000Z', title: sampleItem.title, status: 'handed-off', recordId: 'rec1', tableKey: sampleTable.key }],
+  handOff: () => {},
+  onUpdateRun: () => {},
+}
+
+const listNode = withInjectedState({ 0: tableData, 1: schemaResult, 8: 'list' }, () => renderComponent('TableModule', tableProps, 'TableModule（有数据·汇总清单）'))
+const listText = collectText(listNode).join(' ')
+check('汇总清单渲染出数据行与表头', listText.includes('技能标签支持 Excel 批量导入') && listText.includes('薪资标准对比导出') && listText.includes('需求标题') && collectByType(listNode, 'table').length === 1, listText.slice(0, 120))
+
+const boardNode = withInjectedState({ 0: tableData, 1: schemaResult, 8: 'board' }, () => renderComponent('TableModule', tableProps, 'TableModule（有数据·卡片看板）'))
+const boardText = collectText(boardNode).join(' ')
+check('卡片看板按状态分了模块并列出卡片', boardText.includes('待开发') && boardText.includes('已完成') && collectByType(boardNode, 'article').length === 2, boardText.slice(0, 120))
+
+const progressNode = withInjectedState({ 0: tableData, 1: schemaResult, 8: 'progress' }, () => renderComponent('TableModule', tableProps, 'TableModule（有数据·进度）'))
+const progressText = collectText(progressNode).join(' ')
+check('进度视图给出百分比与分桶', progressText.includes('50%') && progressText.includes('已完成') && collectByType(progressNode, 'i').length >= 3, progressText.slice(0, 140))
+
+const detailNode = withInjectedState({ 0: tableData, 1: schemaResult, 5: 'rec1' }, () => renderComponent('TableModule', tableProps, 'TableModule（选中一条·详情）'))
+check('选中一条会渲染详情组件', collectByType(detailNode, components.DetailView).length === 1 && collectByType(detailNode, components.DetailView)[0].props.item.id === 'rec1')
+
+/* ------------------------------------------------------- 纯函数（页面逻辑） */
+
+console.log('\n[6c] 页面纯函数：配置切片 / 模块 / 进度口径')
+const mergedSlice = pure.sliceForTable?.(
+  { groupField: '需求类型', filters: [{ field: '状态', values: ['待开发'], text: '' }], tables: { [sampleTable.key]: { groupField: '所属项目', listFields: ['需求标题'] } } },
+  sampleTable.key,
+)
+check('单表配置 = 全局兜底 + 该表切片', mergedSlice?.groupField === '所属项目' && mergedSlice.listFields.join(',') === '需求标题' && mergedSlice.filters.length === 1, mergedSlice)
+check('没有切片的表用全局默认', pure.sliceForTable?.({ groupField: '需求类型' }, 'task:none')?.groupField === '需求类型')
+
+const defaults = pure.defaultModules?.([sampleTable, { key: 'task:x', label: '开发任务 · x', kind: 'task' }])
+check('默认模块 = 每张表一个清单模块', Array.isArray(defaults) && defaults.length === 2 && defaults[0].tableKey === sampleTable.key && defaults[0].view === 'list', defaults)
+
+const buckets = pure.summarizeBuckets?.(
+  [
+    { fields: { 状态: '待开发' } },
+    { fields: { 状态: '待开发' } },
+    { fields: { 状态: '已完成' } },
+    { fields: { 状态: '开发中' } },
+    { fields: {} },
+  ],
+  '状态',
+)
+check('进度口径：完成/进行/待办/百分比', buckets?.total === 5 && buckets.done === 1 && buckets.active === 1 && buckets.todo === 3 && buckets.percent === 20, buckets)
+check('未填写的值单独成桶', (buckets?.buckets ?? []).some((bucket) => bucket.value === '（未填写）'))
+check('时间格式化', /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(pure.formatTime?.('2026-10-22T10:00:00.000Z') ?? ''), pure.formatTime?.('2026-10-22T10:00:00.000Z'))
+
+/* ------------------------- 用真实记录验证清单文本与看板分组（页面同源代码） */
+
+const realItems = !real.json?.error && Array.isArray(real.json?.items) ? real.json.items : []
+if (realItems.length && pure.buildModules) {
+  const grouped = pure.buildModules(realItems, '状态', (fieldSchema.json?.fields ?? []).map((field) => ({ name: field.name, options: field.options })), { moduleOrder: [], collapsedModules: [], hiddenModules: [] })
+  check('看板按「状态」把真实记录分成了模块', grouped.length > 0 && grouped.every((module) => Array.isArray(module.items)), grouped.map((module) => `${module.key}:${module.items.length}`))
+}
 
 if (!real.json?.error && real.json?.items?.length) {
   const items = real.json.items
@@ -317,6 +540,93 @@ if (!real.json?.error && real.json?.items?.length) {
   const inOptions = withStatus.filter((item) => options.includes(item.fields['状态'])).length
   check('筛选用到的「状态」选项值与真实数据对得上', options.length > 0 && inOptions === withStatus.length, { options, inOptions, withStatus: withStatus.length, total: items.length })
 }
+
+/* ------------------------------------- 多表：需求池 + 开发任务表（新） */
+
+console.log('\n[7] 多张飞书表：清单 / 表结构 / 跨表总览')
+await writeFile(
+  join(projectDir, '.dev-task-sources.json'),
+  JSON.stringify(
+    {
+      version: 1,
+      defaultProject: 'dahua-skill-service',
+      projects: {
+        'dahua-skill-service': {
+          baseUrl: REAL_TASK_URL,
+          tableName: '开发任务表',
+          identity: 'user',
+          fields: {
+            id: '任务编号',
+            title: '任务标题',
+            requirementId: '关联需求编号',
+            module: '所属模块',
+            type: '任务类型',
+            status: '状态',
+            owner: '负责人',
+            reviewer: '评审人',
+            priority: '优先级',
+            estimate: '预估工时',
+            branch: '开发分支',
+            mrLink: 'MR 链接',
+            evidence: '交付证据',
+          },
+        },
+      },
+    },
+    null,
+    2,
+  ),
+  'utf8',
+)
+
+const tableList = await call('GET', '/tables')
+check(
+  '/tables 认出项目里的两张表',
+  tableList.status === 200 && tableList.json?.tables?.length === 2 && tableList.json.tables.map((table) => table.kind).sort().join(',') === 'requirement,task',
+  tableList.json?.tables?.map((table) => table.key),
+)
+
+const taskRecords = await call('GET', `/records?table=${encodeURIComponent('task:dahua-skill-service')}`)
+if (taskRecords.json?.error) {
+  warn('读开发任务表失败（环境/权限问题）', String(taskRecords.json.detail || '').slice(0, 200))
+} else {
+  check('读开发任务表记录', taskRecords.status === 200 && taskRecords.json?.table?.kind === 'task' && Array.isArray(taskRecords.json?.items), { count: taskRecords.json?.count })
+  if (taskRecords.json?.items?.length) {
+    console.log(`       任务样例：${taskRecords.json.items.slice(0, 3).map((item) => `${item.code || '-'} ${item.title} [${item.status || '-'}] ${item.module || ''}`.trim()).join(' ｜ ')}`)
+  }
+}
+
+const taskSchema = await call('GET', `/fields?table=${encodeURIComponent('task:dahua-skill-service')}`)
+check('读开发任务表的表结构', taskSchema.status === 200 && (taskSchema.json?.fields?.length ?? 0) > 0, (taskSchema.json?.fields ?? []).map((field) => field.name).slice(0, 6))
+
+const overview = await call('GET', '/overview')
+check('/overview 汇总两张表', overview.status === 200 && Array.isArray(overview.json?.tables) && overview.json.tables.length === 2, overview.json?.tables?.map((table) => ({ key: table.key, total: table.total, error: table.error })))
+const withProgress = (overview.json?.tables ?? []).find((table) => table.progress)
+if (withProgress) {
+  console.log(
+    `       进度：${withProgress.label} 共 ${withProgress.progress.total} 条，按「${withProgress.progress.field}」分布 ${withProgress.progress.buckets.map((bucket) => `${bucket.value}:${bucket.count}`).join(' / ')}，完成 ${withProgress.progress.percent}%`,
+  )
+  check('总览带进度统计', withProgress.progress.total > 0 && Array.isArray(withProgress.progress.buckets))
+} else {
+  warn('总览没有拿到进度统计（两张表都没读到数据）')
+}
+
+/* --------------------------------------------- 工作台执行记录（新） */
+
+console.log('\n[8] 工作台自己的执行记录')
+const runCreate = await call('POST', '/runs', { tableKey: 'requirement:dahua-skill-service', recordId: 'recSMOKE1', title: '冒烟测试·执行记录', projectDir: projectDir, note: '冒烟测试写入' })
+check('新增执行记录', runCreate.status === 200 && runCreate.json?.ok === true && runCreate.json.items.length === 1, runCreate.json?.error)
+const runId = runCreate.json?.run?.id
+const runUpdate = await call('POST', '/runs/status', { id: runId, status: 'done', note: '验证完成' })
+check('更新执行记录状态', runUpdate.status === 200 && runUpdate.json?.items?.[0]?.status === 'done' && runUpdate.json.items[0].history.length === 2)
+const runsBack = await call('GET', '/runs')
+check('执行记录可读回', runsBack.status === 200 && runsBack.json?.items?.[0]?.id === runId)
+check('执行记录按事件追加写在 runs.jsonl', await (async () => {
+  const { readFile } = await import('node:fs/promises')
+  const text = await readFile(join(root, 'runs.jsonl'), 'utf8').catch(() => '')
+  return text.split('\n').filter(Boolean).length === 2
+})())
+check('非法状态被拒绝', (await call('POST', '/runs/status', { id: runId, status: '乱写' })).status === 400)
 
 await rm(root, { recursive: true, force: true })
 

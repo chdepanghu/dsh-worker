@@ -11,7 +11,7 @@
  */
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { readFile, mkdir, readdir, rm, writeFile } from 'node:fs/promises'
+import { readFile, mkdir, readdir, rm, writeFile, appendFile } from 'node:fs/promises'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 
@@ -150,6 +150,11 @@ async function writeSettings(config, patch) {
 /* --------------------------------------------------- 清单/看板的视图配置 */
 
 const DEFAULT_VIEW = {
+  // v3：多表 + 可扩展模块
+  modules: [], // [{ key, tableKey, title, view: 'list' | 'board' | 'progress' }]
+  activeModule: '',
+  tables: {}, // tableKey -> 该表的页面配置切片
+  // v2 单表时代的字段，保留为「任何表的兜底默认值」
   filters: [], // [{ field, values: [], text: '' }] 字段级筛选（选项多选 / 文本包含）
   groupField: '状态', // 卡片看板按哪个字段分模块
   cardSummaryField: '', // 卡片上展示的内容字段（空 = 原始需求）
@@ -158,6 +163,36 @@ const DEFAULT_VIEW = {
   hiddenModules: [], // 隐藏的模块
   collapsedModules: [], // 折叠的模块
   writeBackOnDrag: false, // 拖动卡片换模块时是否回写飞书
+}
+
+/** 单张表的配置切片：只接受已知键，防脏数据。 */
+function sanitizeTableSlice(slice) {
+  const out = {}
+  if (!slice || typeof slice !== 'object') return out
+  if (Array.isArray(slice.filters)) {
+    out.filters = slice.filters
+      .filter((item) => item && typeof item.field === 'string' && item.field)
+      .map((item) => ({ field: item.field, values: asStringArray(item.values), text: String(item.text ?? '') }))
+  }
+  for (const key of ['groupField', 'cardSummaryField']) {
+    if (typeof slice[key] === 'string') out[key] = slice[key]
+  }
+  for (const key of ['listFields', 'moduleOrder', 'hiddenModules', 'collapsedModules']) {
+    if (Array.isArray(slice[key])) out[key] = asStringArray(slice[key])
+  }
+  if (typeof slice.writeBackOnDrag === 'boolean') out.writeBackOnDrag = slice.writeBackOnDrag
+  return out
+}
+
+/** 一个模块项：key 唯一，指向某张表 + 一种视图。 */
+function sanitizeModule(item, index) {
+  if (!item || typeof item !== 'object' || typeof item.tableKey !== 'string' || !item.tableKey) return null
+  return {
+    key: String(item.key || `${item.tableKey}#${index}`),
+    tableKey: item.tableKey,
+    title: String(item.title || item.tableKey),
+    view: ['list', 'board', 'progress'].includes(item.view) ? item.view : 'list',
+  }
 }
 
 function viewFile(config) {
@@ -173,9 +208,15 @@ async function readView(config) {
     const raw = await readFile(viewFile(config), 'utf8')
     const parsed = JSON.parse(raw)
     const source = parsed && typeof parsed === 'object' ? parsed : {}
+    const tables = {}
+    for (const [key, slice] of Object.entries(source.tables && typeof source.tables === 'object' ? source.tables : {})) {
+      tables[key] = sanitizeTableSlice(slice)
+    }
     return {
       ...DEFAULT_VIEW,
       ...source,
+      modules: Array.isArray(source.modules) ? source.modules.map(sanitizeModule).filter(Boolean) : [],
+      tables,
       filters: Array.isArray(source.filters)
         ? source.filters
             .filter((item) => item && typeof item.field === 'string' && item.field)
@@ -188,13 +229,23 @@ async function readView(config) {
       writeBackOnDrag: Boolean(source.writeBackOnDrag),
     }
   } catch {
-    return { ...DEFAULT_VIEW, filters: [], listFields: [], moduleOrder: [], hiddenModules: [], collapsedModules: [] }
+    return { ...DEFAULT_VIEW, modules: [], tables: {}, filters: [], listFields: [], moduleOrder: [], hiddenModules: [], collapsedModules: [] }
   }
 }
 
 async function writeView(config, patch) {
   const current = await readView(config)
   const next = { ...current }
+  if (Array.isArray(patch?.modules)) {
+    next.modules = patch.modules.map(sanitizeModule).filter(Boolean)
+  }
+  if (typeof patch?.activeModule === 'string') next.activeModule = patch.activeModule
+  if (patch?.tables && typeof patch.tables === 'object') {
+    next.tables = { ...(current.tables ?? {}) }
+    for (const [key, slice] of Object.entries(patch.tables)) {
+      next.tables[key] = { ...(next.tables[key] ?? {}), ...sanitizeTableSlice(slice) }
+    }
+  }
   if (Array.isArray(patch?.filters)) {
     next.filters = patch.filters
       .filter((item) => item && typeof item.field === 'string' && item.field)
@@ -211,6 +262,267 @@ async function writeView(config, patch) {
   await mkdir(dirname(viewFile(config)), { recursive: true })
   await writeFile(viewFile(config), `${JSON.stringify(next, null, 2)}\n`, 'utf8')
   return next
+}
+
+/* ----------------------------------- 多张飞书表（需求池 + 开发任务表…） */
+
+const TASK_CONFIG_FILES = ['.dev-task-sources.json', join('doc', 'dev-task-sources.json')]
+
+/** 读项目里已有的开发任务表配置（dev-task-sync 用的那一份）。 */
+export async function loadTaskTables(projectDir) {
+  if (!projectDir) return null
+  for (const rel of TASK_CONFIG_FILES) {
+    const file = join(projectDir, rel)
+    const text = await readFile(file, 'utf8').catch(() => null)
+    if (text === null) continue
+    let parsed
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      continue
+    }
+    const raw = parsed?.projects && typeof parsed.projects === 'object' ? parsed.projects : {}
+    const names = Object.keys(raw)
+    if (!names.length) continue
+    return {
+      path: file,
+      defaultProject: parsed.defaultProject && raw[parsed.defaultProject] ? parsed.defaultProject : names[0],
+      projects: names.map((name) => ({ name, ...raw[name] })),
+    }
+  }
+  return null
+}
+
+function tableSpecFrom({ key, label, kind, sourceName, entry, configPath, defaultIdentity }) {
+  const url = parseBaseInput(entry?.baseUrl ?? '')
+  return {
+    key,
+    label,
+    kind,
+    sourceName,
+    tableName: String(entry?.tableName ?? ''),
+    baseToken: url.baseToken,
+    tableId: url.tableId || '',
+    viewId: url.viewId || '',
+    fieldMap: entry?.fields ?? null,
+    filter: entry?.filter ?? null,
+    identity: entry?.identity || defaultIdentity || 'user',
+    configPath: configPath ?? '',
+  }
+}
+
+/** 所有可用的表：项目里配了几张就有几张。 */
+export async function listTables(config, settings) {
+  const tables = []
+  const requirement = await loadRequirementSources(settings.projectDir)
+  for (const source of requirement?.sources ?? []) {
+    tables.push(
+      tableSpecFrom({
+        key: `requirement:${source.name}`,
+        label: `开发需求 · ${source.name}`,
+        kind: 'requirement',
+        sourceName: source.name,
+        entry: source,
+        configPath: requirement.path,
+        defaultIdentity: config.identity,
+      }),
+    )
+  }
+  const tasks = await loadTaskTables(settings.projectDir)
+  for (const project of tasks?.projects ?? []) {
+    tables.push(
+      tableSpecFrom({
+        key: `task:${project.name}`,
+        label: `开发任务 · ${project.name}`,
+        kind: 'task',
+        sourceName: project.name,
+        entry: project,
+        configPath: tasks.path,
+        defaultIdentity: config.identity,
+      }),
+    )
+  }
+  const usable = tables.filter((table) => table.baseToken && table.tableId)
+  return { tables: usable, requirementConfig: requirement?.path ?? '', taskConfig: tasks?.path ?? '' }
+}
+
+export async function findTable(config, settings, key) {
+  const { tables, requirementConfig, taskConfig } = await listTables(config, settings)
+  const wanted = String(key ?? '').trim()
+  const found = wanted
+    ? tables.find((table) => table.key === wanted) ??
+      tables.find((table) => table.sourceName === wanted) ??
+      tables.find((table) => table.tableId === wanted)
+    : null
+  return { table: found ?? tables[0] ?? null, tables, requirementConfig, taskConfig }
+}
+
+const recordCache = new Map()
+const RECORD_CACHE_MS = 60_000
+
+/** 读一张表的原始记录（60 秒内存缓存，可 fresh 强制刷新）。 */
+async function fetchTableRecords(config, table, { fresh = false, limit = 2000 } = {}) {
+  const cacheId = `${config.root}|${table.key}`
+  const hit = recordCache.get(cacheId)
+  if (!fresh && hit && Date.now() - hit.at < RECORD_CACHE_MS) return hit.payload
+  const larkCli = await resolveLarkCli(config.larkCli)
+  const wrapper = shellWrapper(larkCli)
+  const common = ['base', '+record-list', '--base-token', table.baseToken, '--table-id', table.tableId, '--as', table.identity]
+  if (table.viewId) common.push('--view-id', table.viewId)
+  const pullDir = join(config.root, 'pull')
+  await mkdir(pullDir, { recursive: true })
+  const outFile = join(pullDir, `${String(table.tableId).replace(/[^\w.-]/g, '_') || 'records'}.ndjson`)
+  const ndjson = await runCommand(wrapper.file, [...wrapper.args, ...common, '--limit', String(limit), '--format', 'ndjson', '--output', outFile, '--overwrite'])
+  let records = []
+  let fetchMode = 'ndjson'
+  let warning = ''
+  if (ndjson.ok) {
+    const text = await readFile(outFile, 'utf8').catch(() => '')
+    records = parseLarkRecords(text)
+    await rm(outFile, { force: true }).catch(() => {})
+  } else {
+    fetchMode = 'json'
+    const json = await runCommand(wrapper.file, [...wrapper.args, ...common, '--limit', '200', '--format', 'json'])
+    if (!json.ok) {
+      return {
+        ok: false,
+        records: [],
+        error: '读取飞书多维表格失败',
+        detail: (json.stderr || json.stdout || ndjson.stderr || '').trim().slice(0, 1500),
+        command: `lark-cli base +record-list --base-token ${table.baseToken} --table-id ${table.tableId} --as ${table.identity}`,
+      }
+    }
+    records = await matrixToRecords(wrapper, table, json.stdout)
+    if (!records.length) warning = '表格返回的是值矩阵，但没有拿到可对齐的列名，请把字段名补进该表的配置。'
+  }
+  const payload = { ok: true, records, fetchMode, warning, at: Date.now() }
+  recordCache.set(cacheId, { at: Date.now(), payload })
+  return payload
+}
+
+/** 任意一张表的记录 -> 统一结构（标题/状态/负责人等按该表的字段映射取）。 */
+export function normalizeTableRecord(record, fieldMap) {
+  const fields = record?.fields && typeof record.fields === 'object' ? record.fields : record ?? {}
+  const names = Object.keys(fields)
+  const mapped = (logical) => {
+    const actual = fieldMap?.[logical]
+    return actual && actual in fields ? toPlain(fields[actual]) : ''
+  }
+  const title = mapped('title') || toPlain(fields[pickField(fields, '', ['需求标题', '任务标题', '标题', '名称', 'title', 'name'])]) || toPlain(fields[names[0]]) || '（无标题记录）'
+  return {
+    id: String(record?.record_id ?? record?.recordId ?? ''),
+    title,
+    status: mapped('status') || toPlain(fields[pickField(fields, '', ['状态', 'status', '进度'])]),
+    owner: mapped('owner') || toPlain(fields[pickField(fields, '', ['负责人', '指派', 'owner', 'assignee', '处理人'])]),
+    reviewer: mapped('reviewer'),
+    priority: mapped('priority'),
+    type: mapped('type'),
+    module: mapped('module'),
+    code: mapped('id'),
+    requirementId: mapped('requirementId'),
+    branch: mapped('branch'),
+    mrLink: mapped('mrLink'),
+    evidence: mapped('evidence'),
+    estimate: mapped('estimate'),
+    fieldNames: names,
+    fields: Object.fromEntries(names.map((key) => [key, toPlain(fields[key])])),
+  }
+}
+
+const PROGRESS_DONE = ['已完成', '通过', '已验收', '已合并', 'done', 'closed']
+const PROGRESS_ACTIVE = ['开发中', '联调中', '评审中', '进行中', '已领取', 'in progress']
+
+/** 按某个字段统计一张表的进度分布。 */
+export function summarizeProgress(items, field) {
+  const buckets = new Map()
+  for (const item of items) {
+    const value = String(item.fields?.[field] ?? '').trim() || '（未填写）'
+    buckets.set(value, (buckets.get(value) ?? 0) + 1)
+  }
+  const list = [...buckets.entries()].map(([value, count]) => ({ value, count })).sort((a, b) => b.count - a.count)
+  const sumOf = (words) =>
+    list.filter((entry) => words.some((word) => entry.value.toLowerCase().includes(word.toLowerCase()))).reduce((sum, entry) => sum + entry.count, 0)
+  const done = sumOf(PROGRESS_DONE)
+  const active = sumOf(PROGRESS_ACTIVE)
+  const total = items.length
+  return { field, total, buckets: list, done, active, todo: Math.max(0, total - done - active), percent: total ? Math.round((done / total) * 100) : 0 }
+}
+
+/** 跨表总览：每张表的总数、按状态字段的进度分布、几条样例。 */
+async function buildOverview(config, settings, { fresh = false } = {}) {
+  const { tables } = await listTables(config, settings)
+  const out = []
+  for (const table of tables) {
+    const payload = await fetchTableRecords(config, table, { fresh })
+    if (!payload.ok) {
+      out.push({ key: table.key, label: table.label, kind: table.kind, tableName: table.tableName, error: payload.error, detail: payload.detail })
+      continue
+    }
+    const items = payload.records.map((record) => normalizeTableRecord(record, table.fieldMap))
+    const field = table.fieldMap?.status || pickField(items[0]?.fields ?? {}, '', ['状态', 'status', '进度'])
+    out.push({
+      key: table.key,
+      label: table.label,
+      kind: table.kind,
+      tableName: table.tableName,
+      configPath: table.configPath,
+      total: items.length,
+      fetchMode: payload.fetchMode,
+      warning: payload.warning,
+      progress: field ? summarizeProgress(items, field) : null,
+      sample: items.slice(0, 4).map((item) => ({ id: item.id, title: item.title, status: item.status, owner: item.owner })),
+    })
+  }
+  return { tables: out, generatedAt: new Date().toISOString() }
+}
+
+/* ------------------------------------------- 工作台自己的执行记录（runs） */
+
+function runsFile(config) {
+  return join(config.root, 'runs.jsonl')
+}
+
+/** 事件流 -> 最新状态（每个 id 一条，附历史）。 */
+export function foldRuns(events) {
+  const map = new Map()
+  for (const event of events) {
+    if (!event || typeof event !== 'object') continue
+    if (event.type === 'create') {
+      const status = event.status || 'handed-off'
+      map.set(event.id, { ...event, status, history: [{ at: event.at, status, note: event.note ?? '' }] })
+      continue
+    }
+    if (event.type === 'update' && map.has(event.id)) {
+      const run = map.get(event.id)
+      run.status = event.status || run.status
+      if (event.note !== undefined) run.note = event.note
+      run.updatedAt = event.at
+      run.history = [...(run.history ?? []), { at: event.at, status: run.status, note: event.note ?? '' }]
+    }
+  }
+  return [...map.values()].sort((a, b) => String(b.at).localeCompare(String(a.at)))
+}
+
+async function readRuns(config) {
+  const text = await readFile(runsFile(config), 'utf8').catch(() => '')
+  const events = text
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line)
+      } catch {
+        return null
+      }
+    })
+    .filter(Boolean)
+  return foldRuns(events)
+}
+
+async function appendRun(config, event) {
+  await mkdir(dirname(runsFile(config)), { recursive: true })
+  await appendFile(runsFile(config), `${JSON.stringify(event)}\n`, 'utf8')
+  return event
 }
 
 /* ------------------------------------------------------------- 飞书需求 */
@@ -440,10 +752,27 @@ function describeRead(source) {
   return `lark-cli base +record-list --base-token ${source.baseToken} --table-id ${source.tableId} --as ${source.identity}`
 }
 
+/** 给前端用的表信息（不含 token）。 */
+function publicTable(table) {
+  return {
+    key: table.key,
+    label: table.label,
+    kind: table.kind,
+    sourceName: table.sourceName,
+    tableName: table.tableName,
+    tableId: table.tableId,
+    identity: table.identity,
+    configPath: table.configPath,
+    filter: table.filter,
+    fieldMap: table.fieldMap,
+  }
+}
+
 async function fetchRequirements(config, settings) {
   const source = await resolveRequirementsSource(config, settings)
+  const described = publicSource(source)
   if (!source.configured) {
-    return { configured: false, items: [], source: publicSource(source), message: '还没有配置飞书多维表格（可以选项目里已有的需求源，或手动粘贴链接）' }
+    return { configured: false, items: [], source: described, message: '还没有配置飞书多维表格（可以选项目里已有的需求源，或手动粘贴链接）' }
   }
   const larkCli = await resolveLarkCli(config.larkCli)
   const wrapper = shellWrapper(larkCli)
@@ -478,7 +807,7 @@ async function fetchRequirements(config, settings) {
       return {
         configured: true,
         items: [],
-        source: publicSource(source),
+        source: described,
         error: '读取飞书多维表格失败',
         detail: (json.stderr || json.stdout || ndjson.stderr || '').trim().slice(0, 1500),
         command: describeRead(source),
@@ -489,7 +818,7 @@ async function fetchRequirements(config, settings) {
   }
 
   const items = records.map((record) => normalizeRecord(record, settings, source.fieldMap))
-  return { configured: true, items, count: items.length, source: publicSource(source), fetchMode, warning }
+  return { configured: true, items, count: items.length, source: described, fetchMode, warning }
 }
 
 async function updateRequirementStatus(config, settings, body) {
@@ -555,17 +884,18 @@ export function parseFieldSchema(stdout) {
     .filter((field) => field.name)
 }
 
-async function fetchFieldSchema(config, settings) {
-  const source = await resolveRequirementsSource(config, settings)
-  if (!source.configured) {
-    return { configured: false, fields: [], source: publicSource(source), message: '还没有配置飞书多维表格' }
+async function fetchFieldSchema(config, settings, explicitTable) {
+  const source = explicitTable ?? (await resolveRequirementsSource(config, settings))
+  if (!source.configured && !explicitTable) {
+    return { configured: false, fields: [], source: described, message: '还没有配置飞书多维表格' }
   }
+  const described = explicitTable ? publicTable(explicitTable) : publicSource(source)
   const cacheFile = fieldSchemaFile(config, source.tableId)
   const cached = await readFile(cacheFile, 'utf8')
     .then((text) => JSON.parse(text))
     .catch(() => null)
   if (cached && Array.isArray(cached.fields) && Date.now() - Number(cached.cachedAt ?? 0) < FIELD_SCHEMA_TTL_MS) {
-    return { configured: true, fields: cached.fields, source: publicSource(source), cachedAt: cached.cachedAt, fromCache: true }
+    return { configured: true, fields: cached.fields, source: described, cachedAt: cached.cachedAt, fromCache: true }
   }
   const larkCli = await resolveLarkCli(config.larkCli)
   const wrapper = shellWrapper(larkCli)
@@ -585,12 +915,12 @@ async function fetchFieldSchema(config, settings) {
   const fields = result.ok ? parseFieldSchema(result.stdout) : []
   if (!fields.length) {
     if (cached?.fields?.length) {
-      return { configured: true, fields: cached.fields, source: publicSource(source), cachedAt: cached.cachedAt, fromCache: true, warning: '读表结构失败，用的是上次缓存' }
+      return { configured: true, fields: cached.fields, source: described, cachedAt: cached.cachedAt, fromCache: true, warning: '读表结构失败，用的是上次缓存' }
     }
     return {
       configured: true,
       fields: [],
-      source: publicSource(source),
+      source: described,
       error: '读取表结构失败',
       detail: (result.stderr || result.stdout || '').trim().slice(0, 1000),
       command: `lark-cli base +field-list --base-token ${source.baseToken} --table-id ${source.tableId} --as ${source.identity}`,
@@ -599,7 +929,7 @@ async function fetchFieldSchema(config, settings) {
   const cachedAt = Date.now()
   await mkdir(dirname(cacheFile), { recursive: true })
   await writeFile(cacheFile, `${JSON.stringify({ tableId: source.tableId, cachedAt, fields }, null, 2)}\n`, 'utf8')
-  return { configured: true, fields, source: publicSource(source), cachedAt }
+  return { configured: true, fields, source: described, cachedAt }
 }
 
 /* ------------------------------------------------------------ 技能/规范 */
@@ -793,7 +1123,96 @@ export function apply(ctx, config) {
 
       if (route === '/fields' && req.method === 'GET') {
         const settings = await readSettings(config)
+        const tableKey = url.searchParams.get('table')
+        if (tableKey) {
+          const { table } = await findTable(config, settings, tableKey)
+          if (!table) return sendJson(res, 404, { error: '没有找到这张表' })
+          return sendJson(res, 200, await fetchFieldSchema(config, settings, table))
+        }
         return sendJson(res, 200, await fetchFieldSchema(config, settings))
+      }
+
+      if (route === '/tables' && req.method === 'GET') {
+        const settings = await readSettings(config)
+        const { tables } = await listTables(config, settings)
+        return sendJson(res, 200, {
+          projectDir: settings.projectDir,
+          tables: tables.map((table) => ({
+            key: table.key,
+            label: table.label,
+            kind: table.kind,
+            sourceName: table.sourceName,
+            tableName: table.tableName,
+            tableId: table.tableId,
+            identity: table.identity,
+            configPath: table.configPath,
+            fields: table.fieldMap,
+            filter: table.filter,
+          })),
+        })
+      }
+
+      if (route === '/records' && req.method === 'GET') {
+        const settings = await readSettings(config)
+        const fresh = url.searchParams.get('fresh') === '1'
+        const { table, tables } = await findTable(config, settings, url.searchParams.get('table'))
+        if (!table) return sendJson(res, 200, { configured: false, items: [], message: '项目里还没有配到飞书表' })
+        const payload = await fetchTableRecords(config, table, { fresh })
+        if (!payload.ok) {
+          return sendJson(res, 200, { configured: true, items: [], table: publicTable(table), error: payload.error, detail: payload.detail, command: payload.command })
+        }
+        const items = payload.records.map((record) => normalizeTableRecord(record, table.fieldMap))
+        return sendJson(res, 200, {
+          configured: true,
+          table: publicTable(table),
+          availableTables: tables.map((entry) => ({ key: entry.key, label: entry.label, kind: entry.kind })),
+          items,
+          count: items.length,
+          fetchMode: payload.fetchMode,
+          warning: payload.warning,
+        })
+      }
+
+      if (route === '/overview' && req.method === 'GET') {
+        const settings = await readSettings(config)
+        const fresh = url.searchParams.get('fresh') === '1'
+        const overview = await buildOverview(config, settings, { fresh })
+        const runs = await readRuns(config)
+        return sendJson(res, 200, { ...overview, runs })
+      }
+
+      if (route === '/runs' && req.method === 'GET') {
+        return sendJson(res, 200, { items: await readRuns(config) })
+      }
+
+      if (route === '/runs' && req.method === 'POST') {
+        const body = await readBody(req)
+        const title = String(body?.title ?? '').trim()
+        if (!title) return sendJson(res, 400, { error: '缺少需求/任务标题' })
+        const event = {
+          type: 'create',
+          id: `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+          at: new Date().toISOString(),
+          tableKey: String(body?.tableKey ?? ''),
+          recordId: String(body?.recordId ?? ''),
+          title,
+          projectDir: String(body?.projectDir ?? ''),
+          status: ['handed-off', 'in-progress', 'done', 'blocked'].includes(body?.status) ? body.status : 'handed-off',
+          note: String(body?.note ?? ''),
+        }
+        await appendRun(config, event)
+        return sendJson(res, 200, { ok: true, run: event, items: await readRuns(config) })
+      }
+
+      if (route === '/runs/status' && req.method === 'POST') {
+        const body = await readBody(req)
+        const id = String(body?.id ?? '').trim()
+        const status = String(body?.status ?? '').trim()
+        if (!id || !['handed-off', 'in-progress', 'done', 'blocked'].includes(status)) {
+          return sendJson(res, 400, { error: '缺少执行记录 id 或状态不合法' })
+        }
+        await appendRun(config, { type: 'update', id, at: new Date().toISOString(), status, note: String(body?.note ?? '') })
+        return sendJson(res, 200, { ok: true, items: await readRuns(config) })
       }
 
       if (route === '/view' && req.method === 'GET') {
@@ -807,8 +1226,25 @@ export function apply(ctx, config) {
 
       if (route === '/requirements' && req.method === 'GET') {
         const settings = await readSettings(config)
-        const result = await fetchRequirements(config, settings)
-        return sendJson(res, 200, result)
+        const tableKey = url.searchParams.get('table')
+        if (!tableKey) return sendJson(res, 200, await fetchRequirements(config, settings))
+        const fresh = url.searchParams.get('fresh') === '1'
+        const { table, tables } = await findTable(config, settings, tableKey)
+        if (!table) return sendJson(res, 200, { configured: false, items: [], message: '没有找到这张表（项目里还没配到）' })
+        const payload = await fetchTableRecords(config, table, { fresh })
+        if (!payload.ok) {
+          return sendJson(res, 200, { configured: true, items: [], source: publicTable(table), error: payload.error, detail: payload.detail, command: payload.command })
+        }
+        const items = payload.records.map((record) => normalizeTableRecord(record, table.fieldMap))
+        return sendJson(res, 200, {
+          configured: true,
+          source: publicTable(table),
+          availableTables: tables.map((entry) => ({ key: entry.key, label: entry.label, kind: entry.kind })),
+          items,
+          count: items.length,
+          fetchMode: payload.fetchMode,
+          warning: payload.warning,
+        })
       }
 
       if (route === '/requirement/status' && req.method === 'POST') {
