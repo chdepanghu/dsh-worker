@@ -12,7 +12,7 @@ import { EventEmitter } from 'node:events'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, normalizeRecord, parseBaseInput, parseLarkRecords } from '../dsh/index.js'
+import { apply, alignMatrixColumns, matrixShape, normalizeRecord, parseBaseInput, parseLarkRecords, recordsFromMatrix } from '../dsh/index.js'
 
 const LARK = process.env.RDW_LARK_CLI || 'D:\\soft\\nodejs\\lark-cli.ps1'
 const BASE_TOKEN = process.env.RDW_TEST_BASE || 'I3YnbPQp6awaxWsC1FZc8v89nyc'
@@ -71,6 +71,57 @@ check('返回体解析：items / data.items / ndjson', (() => {
   return a.length === 1 && b.length === 1 && c.length === 2
 })())
 check('返回体解析：坏数据不抛错', parseLarkRecords('not json at all').length === 0)
+
+/* 值矩阵列序纠偏：真机上遇到过「列顺序 ≠ 字段清单顺序」导致字段串位 */
+
+const schema3 = [
+  { name: '状态', type: 'singleSelect', options: ['待开发', '已完成'] },
+  { name: '需求标题', type: 'text', options: [] },
+  { name: '优先级', type: 'singleSelect', options: ['P0', 'P1'] },
+]
+check('值矩阵：列序错位时按选项值纠正回来', (() => {
+  const rows = [
+    ['技能标签支持 Excel 批量导入', '待开发', 'P0'],
+    ['薪资标准对比导出', '已完成', 'P1'],
+  ]
+  const result = alignMatrixColumns(rows, schema3)
+  return result.aligned === true && result.names.join(',') === '需求标题,状态,优先级'
+})(), alignMatrixColumns([['技能标签支持 Excel 批量导入', '待开发', 'P0']], schema3))
+check('值矩阵：列序正确时原样通过', (() => {
+  const result = alignMatrixColumns([['待开发', '技能标签支持 Excel 批量导入', 'P0']], schema3)
+  return result.aligned === true && result.names.join(',') === '状态,需求标题,优先级'
+})())
+check('值矩阵：纠正不了就不猜（返回空 + 原因）', (() => {
+  const result = alignMatrixColumns([['随便什么', '也不像状态']], [
+    { name: '状态', type: 'singleSelect', options: ['待开发'] },
+    { name: '需求标题', type: 'text', options: [] },
+  ])
+  return result.aligned === false && result.names.length === 0 && result.reason.includes('对不上')
+})())
+check('值矩阵：列数不一致直接判不可用', alignMatrixColumns([['a', 'b']], [{ name: '状态', type: 'text', options: [] }]).aligned === false)
+
+/* 返回体自带字段名（data.fields / data.record_id_list）是列一一对应的权威顺序 */
+
+check('值矩阵：优先用返回体自带的字段名', (() => {
+  const parsed = {
+    data: {
+      data: [['PR-20261008-0001', '- [ ] 验收点', '已领取']],
+      fields: [{ name: '需求编号' }, { name: '验收标准' }, { name: '状态' }],
+      record_id_list: ['rec_1'],
+    },
+  }
+  const shape = matrixShape(parsed)
+  const records = recordsFromMatrix(shape.rows, shape.names, shape.recordIds)
+  const item = normalizeRecord(records[0], { titleField: '需求编号', statusField: '状态' })
+  return (
+    records.length === 1 &&
+    records[0].record_id === 'rec_1' &&
+    records[0].fields['验收标准'] === '- [ ] 验收点' &&
+    item.title === 'PR-20261008-0001' &&
+    item.status === '已领取'
+  )
+})(), matrixShape({ data: { data: [['a']], fields: [{ name: '状态' }] } })?.names)
+check('值矩阵：字段名数不匹配就不产出记录', recordsFromMatrix([['a', 'b']], ['状态']).length === 0 && matrixShape({ data: {} }) === null)
 
 /* ---------------------------------------------------------------- HTTP */
 

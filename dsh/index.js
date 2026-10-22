@@ -373,14 +373,19 @@ async function fetchTableRecords(config, table, { fresh = false, limit = 2000 } 
   await mkdir(pullDir, { recursive: true })
   const outFile = join(pullDir, `${String(table.tableId).replace(/[^\w.-]/g, '_') || 'records'}.ndjson`)
   const ndjson = await runCommand(wrapper.file, [...wrapper.args, ...common, '--limit', String(limit), '--format', 'ndjson', '--output', outFile, '--overwrite'])
-  let records = []
+  // 退出码不可全信：.cmd 包装下 lark-cli 会以非 0 退出，但 ndjson 文件其实写好了。以文件里的记录为准。
+  const ndjsonText = await readFile(outFile, 'utf8').catch(() => '')
+  await rm(outFile, { force: true }).catch(() => {})
+  let records = parseLarkRecords(ndjsonText)
   let fetchMode = 'ndjson'
   let warning = ''
-  if (ndjson.ok) {
-    const text = await readFile(outFile, 'utf8').catch(() => '')
-    records = parseLarkRecords(text)
-    await rm(outFile, { force: true }).catch(() => {})
-  } else {
+  let ndjsonError = ''
+  if (!records.length) {
+    ndjsonError = ndjson.ok ? 'ndjson 输出里没有解析到记录' : `lark-cli 退出码 ${ndjson.code ?? '?'}：${(ndjson.stderr || ndjson.stdout || '').trim().slice(0, 400)}`
+  } else if (!ndjson.ok) {
+    warning = `lark-cli 退出码 ${ndjson.code ?? '?'}，但 ndjson 文件里已有 ${records.length} 条记录，按记录显示。`
+  }
+  if (!records.length) {
     fetchMode = 'json'
     const json = await runCommand(wrapper.file, [...wrapper.args, ...common, '--limit', '200', '--format', 'json'])
     if (!json.ok) {
@@ -388,14 +393,26 @@ async function fetchTableRecords(config, table, { fresh = false, limit = 2000 } 
         ok: false,
         records: [],
         error: '读取飞书多维表格失败',
-        detail: (json.stderr || json.stdout || ndjson.stderr || '').trim().slice(0, 1500),
+        detail: (json.stderr || json.stdout || ndjsonError || '').trim().slice(0, 1500),
         command: `lark-cli base +record-list --base-token ${table.baseToken} --table-id ${table.tableId} --as ${table.identity}`,
       }
     }
-    records = await matrixToRecords(wrapper, table, json.stdout)
-    if (!records.length) warning = '表格返回的是值矩阵，但没有拿到可对齐的列名，请把字段名补进该表的配置。'
+    const matrix = await matrixToRecords(wrapper, table, json.stdout)
+    if (!matrix.aligned) {
+      // 值矩阵没法对齐字段：宁可报错，也不能显示串了位的字段。
+      return {
+        ok: false,
+        records: [],
+        error: '这张表读到的列和字段名对不上，已停下不展示（避免显示错的字段）',
+        detail: `${matrix.reason}；ndjson 通道失败原因：${ndjsonError || '未知'}`,
+        command: `lark-cli base +record-list --base-token ${table.baseToken} --table-id ${table.tableId} --as ${table.identity} --format ndjson`,
+      }
+    }
+    records = matrix.records
+    warning = `ndjson 通道不可用，已退回值矩阵并按选项值校正列顺序（${matrix.reason}）。`
+    if (ndjsonError) warning += `ndjson 失败原因：${ndjsonError.slice(0, 200)}`
   }
-  const payload = { ok: true, records, fetchMode, warning, at: Date.now() }
+  const payload = { ok: true, records, fetchMode, warning, ndjsonError, at: Date.now() }
   recordCache.set(cacheId, { at: Date.now(), payload })
   return payload
 }
@@ -712,16 +729,99 @@ function publicSource(source) {
 }
 
 /** json matrix（值矩阵）兜底：列名取自 +field-list，列数不一致就不猜。 */
+/**
+ * 值矩阵的列顺序不一定等于 +field-list 的顺序（真机上就遇到过整体错位）。
+ * 用字段类型/选项值做校验：能唯一对上就用纠正后的顺序，对不上就明确报错，绝不猜着显示。
+ */
+export function alignMatrixColumns(rows, schema) {
+  const width = Array.isArray(rows?.[0]) ? rows[0].length : 0
+  if (!schema?.length || !width) return { names: [], aligned: false, reason: '没有可用的字段清单' }
+  if (schema.length !== width) return { names: [], aligned: false, reason: `列数不一致（字段 ${schema.length} / 数据 ${width}）` }
+  const byName = new Map(schema.map((field) => [field.name, field]))
+  const optionSet = (field) => new Set((field?.options ?? []).map(String))
+  const partsOf = (value) => {
+    if (value === null || value === undefined || value === '') return []
+    const list = Array.isArray(value) ? value : [value]
+    return list.flatMap((item) => String(item).split(/[,，]/)).map((item) => item.trim()).filter(Boolean)
+  }
+  /** 某字段放在第 index 列时的违规数：选项字段的值必须落在它的选项里。 */
+  const violations = (field, index) => {
+    const options = optionSet(field)
+    if (!options.size) return 0
+    let bad = 0
+    for (const row of rows) {
+      const parts = partsOf(row[index])
+      if (parts.some((part) => !options.has(part))) bad += 1
+    }
+    return bad
+  }
+  const scoreOf = (names) => names.reduce((sum, name, index) => sum + violations(byName.get(name), index), 0)
+  const natural = schema.map((field) => field.name)
+  const naturalScore = scoreOf(natural)
+  if (naturalScore === 0) return { names: natural, aligned: true, reason: '列顺序与字段清单一致' }
+
+  // 用「有选项的字段」去认列：能唯一装下它的列就钉住，其余字段按原顺序补空位。
+  const pinned = new Map()
+  const pinnedFields = new Set()
+  for (const field of schema.filter((item) => (item.options ?? []).length)) {
+    const matches = []
+    for (let index = 0; index < width; index += 1) {
+      if (pinned.has(index) || violations(field, index) !== 0) continue
+      const filled = rows.some((row) => partsOf(row[index]).length)
+      if (filled) matches.push(index)
+    }
+    if (matches.length === 1) {
+      pinned.set(matches[0], field.name)
+      pinnedFields.add(field.name)
+    }
+  }
+  const rest = natural.filter((name) => !pinnedFields.has(name))
+  const candidate = []
+  for (let index = 0; index < width; index += 1) candidate.push(pinned.get(index) ?? rest.shift() ?? '')
+  const candidateScore = scoreOf(candidate)
+  if (candidate.length === width && candidate.every(Boolean) && candidateScore === 0) {
+    return { names: candidate, aligned: true, reason: `按选项值纠正了列顺序（原违规 ${naturalScore} 处，纠正后 0 处）` }
+  }
+  return { names: [], aligned: false, reason: `列顺序对不上字段清单（违规 ${naturalScore} 处，自动纠正后仍有 ${candidateScore} 处）` }
+}
+
+/** 值矩阵自带字段名与记录 id：`data.fields` / `data.record_id_list` 与列一一对应，是权威顺序。 */
+export function matrixShape(parsed) {
+  const rows = parsed?.data?.data
+  if (!Array.isArray(rows) || !rows.length || rows.every((row) => !Array.isArray(row))) return null
+  const names = Array.isArray(parsed?.data?.fields)
+    ? parsed.data.fields.map((field) => (typeof field === 'string' ? field : String(field?.name ?? '')))
+    : []
+  const recordIds = Array.isArray(parsed?.data?.record_id_list) ? parsed.data.record_id_list.map(String) : []
+  return { rows, names, recordIds }
+}
+
+/** 值矩阵 + 字段名 -> 记录；列数与字段名对不上就返回空（宁可不显示，也不能串字段）。 */
+export function recordsFromMatrix(rows, names, recordIds = []) {
+  const width = Array.isArray(rows?.[0]) ? rows[0].length : -1
+  if (!rows?.length || !names?.length || names.length !== width || names.some((name) => !name)) return []
+  return rows.map((row, index) => ({
+    record_id: recordIds[index] ?? '',
+    fields: Object.fromEntries(names.map((name, column) => [name, row[column] ?? ''])),
+  }))
+}
+
+/** 值矩阵 + 字段清单 -> 记录；对不上就返回空并带上原因（宁可不显示，也不能串字段）。 */
 async function matrixToRecords(wrapper, source, stdout) {
   let parsed
   try {
     parsed = JSON.parse(stdout)
   } catch {
-    return []
+    return { records: [], aligned: false, reason: '返回内容不是 JSON' }
   }
-  const rows = parsed?.data?.data
-  if (!Array.isArray(rows) || !rows.length) return extractRecords(parsed)
-  if (rows.every((row) => !Array.isArray(row))) return extractRecords(parsed)
+  const shape = matrixShape(parsed)
+  if (!shape) return { records: extractRecords(parsed), aligned: true, reason: '按对象形式解析' }
+  const { rows, names, recordIds } = shape
+  // 首选返回体自带的字段名：它和列严格一一对应。
+  const inline = recordsFromMatrix(rows, names, recordIds)
+  if (inline.length) return { records: inline, aligned: true, reason: `按返回体自带的 ${names.length} 个字段名对齐` }
+
+  // 没有自带字段名时，才退回 +field-list 并用选项值校正列顺序。
   const listed = await runCommand(wrapper.file, [
     ...wrapper.args,
     'base',
@@ -735,17 +835,10 @@ async function matrixToRecords(wrapper, source, stdout) {
     '--format',
     'json',
   ])
-  let names = []
-  try {
-    names = (JSON.parse(listed.stdout)?.data?.fields ?? []).map((field) => field.name)
-  } catch {
-    names = []
-  }
-  if (!names.length || names.length !== rows[0].length) return []
-  return rows.map((row) => ({
-    record_id: '',
-    fields: Object.fromEntries(names.map((name, index) => [name, row[index]])),
-  }))
+  const schema = parseFieldSchema(listed.stdout)
+  const alignment = alignMatrixColumns(rows, schema)
+  if (!alignment.aligned) return { records: [], aligned: false, reason: alignment.reason }
+  return { records: recordsFromMatrix(rows, alignment.names, recordIds), aligned: true, reason: alignment.reason }
 }
 
 function describeRead(source) {
@@ -793,14 +886,19 @@ async function fetchRequirements(config, settings) {
   const outFile = join(pullDir, `${String(source.tableId).replace(/[^\w.-]/g, '_') || 'records'}.ndjson`)
 
   const ndjson = await runCommand(wrapper.file, [...wrapper.args, ...common, '--limit', '2000', '--format', 'ndjson', '--output', outFile, '--overwrite'])
-  let records = []
+  // 同上：.cmd 包装下退出码可能非 0，但文件里有记录就照样用。
+  const ndjsonText = await readFile(outFile, 'utf8').catch(() => '')
+  await rm(outFile, { force: true }).catch(() => {})
+  let records = parseLarkRecords(ndjsonText)
   let fetchMode = 'ndjson'
   let warning = ''
-  if (ndjson.ok) {
-    const text = await readFile(outFile, 'utf8').catch(() => '')
-    records = parseLarkRecords(text)
-    await rm(outFile, { force: true }).catch(() => {})
-  } else {
+  let ndjsonError = ''
+  if (!records.length) {
+    ndjsonError = ndjson.ok ? 'ndjson 输出里没有解析到记录' : `lark-cli 退出码 ${ndjson.code ?? '?'}：${(ndjson.stderr || ndjson.stdout || '').trim().slice(0, 400)}`
+  } else if (!ndjson.ok) {
+    warning = `lark-cli 退出码 ${ndjson.code ?? '?'}，但 ndjson 文件里已有 ${records.length} 条记录，按记录显示。`
+  }
+  if (!records.length) {
     fetchMode = 'json'
     const json = await runCommand(wrapper.file, [...wrapper.args, ...common, '--limit', '200', '--format', 'json'])
     if (!json.ok) {
@@ -809,12 +907,24 @@ async function fetchRequirements(config, settings) {
         items: [],
         source: described,
         error: '读取飞书多维表格失败',
-        detail: (json.stderr || json.stdout || ndjson.stderr || '').trim().slice(0, 1500),
+        detail: (json.stderr || json.stdout || ndjsonError || '').trim().slice(0, 1500),
         command: describeRead(source),
       }
     }
-    records = await matrixToRecords(wrapper, source, json.stdout)
-    if (!records.length) warning = '表格返回的是值矩阵，但没有拿到可对齐的列名，请把字段名补进需求源配置。'
+    const matrix = await matrixToRecords(wrapper, source, json.stdout)
+    if (!matrix.aligned) {
+      return {
+        configured: true,
+        items: [],
+        source: described,
+        error: '这张表读到的列和字段名对不上，已停下不展示（避免显示错的字段）',
+        detail: `${matrix.reason}；ndjson 通道失败原因：${ndjsonError || '未知'}`,
+        command: `${describeRead(source)} --format ndjson`,
+      }
+    }
+    records = matrix.records
+    warning = `ndjson 通道不可用，已退回值矩阵并按选项值校正列顺序（${matrix.reason}）。`
+    if (ndjsonError) warning += `ndjson 失败原因：${ndjsonError.slice(0, 200)}`
   }
 
   const items = records.map((record) => normalizeRecord(record, settings, source.fieldMap))
