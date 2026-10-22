@@ -147,6 +147,72 @@ async function writeSettings(config, patch) {
   return next
 }
 
+/* --------------------------------------------------- 清单/看板的视图配置 */
+
+const DEFAULT_VIEW = {
+  filters: [], // [{ field, values: [], text: '' }] 字段级筛选（选项多选 / 文本包含）
+  groupField: '状态', // 卡片看板按哪个字段分模块
+  cardSummaryField: '', // 卡片上展示的内容字段（空 = 原始需求）
+  listFields: [], // 汇总清单显示的列（空 = 自动挑）
+  moduleOrder: [], // 模块手工排序
+  hiddenModules: [], // 隐藏的模块
+  collapsedModules: [], // 折叠的模块
+  writeBackOnDrag: false, // 拖动卡片换模块时是否回写飞书
+}
+
+function viewFile(config) {
+  return join(config.root, 'view.json')
+}
+
+function asStringArray(value) {
+  return Array.isArray(value) ? value.map(String) : []
+}
+
+async function readView(config) {
+  try {
+    const raw = await readFile(viewFile(config), 'utf8')
+    const parsed = JSON.parse(raw)
+    const source = parsed && typeof parsed === 'object' ? parsed : {}
+    return {
+      ...DEFAULT_VIEW,
+      ...source,
+      filters: Array.isArray(source.filters)
+        ? source.filters
+            .filter((item) => item && typeof item.field === 'string' && item.field)
+            .map((item) => ({ field: item.field, values: asStringArray(item.values), text: String(item.text ?? '') }))
+        : [],
+      listFields: asStringArray(source.listFields),
+      moduleOrder: asStringArray(source.moduleOrder),
+      hiddenModules: asStringArray(source.hiddenModules),
+      collapsedModules: asStringArray(source.collapsedModules),
+      writeBackOnDrag: Boolean(source.writeBackOnDrag),
+    }
+  } catch {
+    return { ...DEFAULT_VIEW, filters: [], listFields: [], moduleOrder: [], hiddenModules: [], collapsedModules: [] }
+  }
+}
+
+async function writeView(config, patch) {
+  const current = await readView(config)
+  const next = { ...current }
+  if (Array.isArray(patch?.filters)) {
+    next.filters = patch.filters
+      .filter((item) => item && typeof item.field === 'string' && item.field)
+      .map((item) => ({ field: item.field, values: asStringArray(item.values), text: String(item.text ?? '') }))
+  }
+  if (typeof patch?.groupField === 'string') next.groupField = patch.groupField
+  if (typeof patch?.cardSummaryField === 'string') next.cardSummaryField = patch.cardSummaryField
+  if (Array.isArray(patch?.listFields)) next.listFields = asStringArray(patch.listFields)
+  if (Array.isArray(patch?.moduleOrder)) next.moduleOrder = asStringArray(patch.moduleOrder)
+  if (Array.isArray(patch?.hiddenModules)) next.hiddenModules = asStringArray(patch.hiddenModules)
+  if (Array.isArray(patch?.collapsedModules)) next.collapsedModules = asStringArray(patch.collapsedModules)
+  if (typeof patch?.writeBackOnDrag === 'boolean') next.writeBackOnDrag = patch.writeBackOnDrag
+  next.updatedAt = new Date().toISOString()
+  await mkdir(dirname(viewFile(config)), { recursive: true })
+  await writeFile(viewFile(config), `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+  return next
+}
+
 /* ------------------------------------------------------------- 飞书需求 */
 
 /** 从粘贴的飞书链接里抽出 base_token（/base/<token>）、table_id 与 view_id。 */
@@ -432,7 +498,7 @@ async function updateRequirementStatus(config, settings, body) {
   const recordId = String(body?.recordId ?? '').trim()
   const status = String(body?.status ?? '').trim()
   if (!recordId || !status) return { ok: false, error: '缺少记录 ID 或状态值' }
-  const statusField = settings.statusField || source.fieldMap?.status || '状态'
+  const statusField = String(body?.field ?? '').trim() || settings.statusField || source.fieldMap?.status || '状态'
   const larkCli = await resolveLarkCli(config.larkCli)
   const wrapper = shellWrapper(larkCli)
   const args = [
@@ -460,6 +526,80 @@ async function updateRequirementStatus(config, settings, body) {
     }
   }
   return { ok: true, field: statusField, status }
+}
+
+/* --------------------------------------------------------- 表结构（字段） */
+
+const FIELD_SCHEMA_TTL_MS = 10 * 60 * 1000
+
+function fieldSchemaFile(config, tableId) {
+  return join(config.root, `fields-${String(tableId).replace(/[^\w.-]/g, '_') || 'table'}.json`)
+}
+
+/** +field-list 的返回 -> 精简的字段清单（名称/类型/选项值）。 */
+export function parseFieldSchema(stdout) {
+  let parsed
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    return []
+  }
+  const list = parsed?.data?.fields
+  if (!Array.isArray(list)) return []
+  return list
+    .map((field) => ({
+      name: String(field?.name ?? ''),
+      type: String(field?.type ?? ''),
+      options: Array.isArray(field?.options) ? field.options.map((option) => String(option?.name ?? '')).filter(Boolean) : [],
+    }))
+    .filter((field) => field.name)
+}
+
+async function fetchFieldSchema(config, settings) {
+  const source = await resolveRequirementsSource(config, settings)
+  if (!source.configured) {
+    return { configured: false, fields: [], source: publicSource(source), message: '还没有配置飞书多维表格' }
+  }
+  const cacheFile = fieldSchemaFile(config, source.tableId)
+  const cached = await readFile(cacheFile, 'utf8')
+    .then((text) => JSON.parse(text))
+    .catch(() => null)
+  if (cached && Array.isArray(cached.fields) && Date.now() - Number(cached.cachedAt ?? 0) < FIELD_SCHEMA_TTL_MS) {
+    return { configured: true, fields: cached.fields, source: publicSource(source), cachedAt: cached.cachedAt, fromCache: true }
+  }
+  const larkCli = await resolveLarkCli(config.larkCli)
+  const wrapper = shellWrapper(larkCli)
+  const result = await runCommand(wrapper.file, [
+    ...wrapper.args,
+    'base',
+    '+field-list',
+    '--base-token',
+    source.baseToken,
+    '--table-id',
+    source.tableId,
+    '--as',
+    source.identity,
+    '--format',
+    'json',
+  ])
+  const fields = result.ok ? parseFieldSchema(result.stdout) : []
+  if (!fields.length) {
+    if (cached?.fields?.length) {
+      return { configured: true, fields: cached.fields, source: publicSource(source), cachedAt: cached.cachedAt, fromCache: true, warning: '读表结构失败，用的是上次缓存' }
+    }
+    return {
+      configured: true,
+      fields: [],
+      source: publicSource(source),
+      error: '读取表结构失败',
+      detail: (result.stderr || result.stdout || '').trim().slice(0, 1000),
+      command: `lark-cli base +field-list --base-token ${source.baseToken} --table-id ${source.tableId} --as ${source.identity}`,
+    }
+  }
+  const cachedAt = Date.now()
+  await mkdir(dirname(cacheFile), { recursive: true })
+  await writeFile(cacheFile, `${JSON.stringify({ tableId: source.tableId, cachedAt, fields }, null, 2)}\n`, 'utf8')
+  return { configured: true, fields, source: publicSource(source), cachedAt }
 }
 
 /* ------------------------------------------------------------ 技能/规范 */
@@ -649,6 +789,20 @@ export function apply(ctx, config) {
             filter: item.filter ?? null,
           })),
         })
+      }
+
+      if (route === '/fields' && req.method === 'GET') {
+        const settings = await readSettings(config)
+        return sendJson(res, 200, await fetchFieldSchema(config, settings))
+      }
+
+      if (route === '/view' && req.method === 'GET') {
+        return sendJson(res, 200, { view: await readView(config) })
+      }
+
+      if (route === '/view' && req.method === 'POST') {
+        const body = await readBody(req)
+        return sendJson(res, 200, { view: await writeView(config, body) })
       }
 
       if (route === '/requirements' && req.method === 'GET') {

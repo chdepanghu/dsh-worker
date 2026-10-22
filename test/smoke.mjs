@@ -250,6 +250,74 @@ if (real.json?.error) {
   }
 }
 
+/* ------------------------------------------- 表结构 + 视图配置（新） */
+
+console.log('\n[5] 表结构与页面配置')
+const fieldSchema = await call('GET', '/fields')
+if (fieldSchema.json?.error) {
+  warn('读表结构失败（环境问题）', String(fieldSchema.json.detail || '').slice(0, 200))
+} else {
+  const names = (fieldSchema.json?.fields ?? []).map((field) => field.name)
+  check('读到表结构字段', names.length > 0, { count: names.length })
+  check('字段带选项值（用于筛选/分组）', (fieldSchema.json?.fields ?? []).some((field) => field.options?.length))
+  check('表结构写进了缓存文件', await (async () => {
+    const { readdir } = await import('node:fs/promises')
+    const files = await readdir(root).catch(() => [])
+    return files.some((name) => name.startsWith('fields-'))
+  })())
+  console.log(`       字段：${names.slice(0, 8).join(' / ')}…`)
+}
+
+const view0 = await call('GET', '/view')
+check('/view 返回默认配置', view0.status === 200 && view0.json?.view?.groupField === '状态' && Array.isArray(view0.json.view.filters))
+
+const savedView = await call('POST', '/view', {
+  filters: [
+    { field: '状态', values: ['待开发', '已领取'] },
+    { field: '原始需求', text: '导入' },
+  ],
+  groupField: '需求类型',
+  cardSummaryField: '详细设计',
+  listFields: ['需求标题', '状态', '优先级'],
+  moduleOrder: ['性能优化', '新功能'],
+  hiddenModules: ['技术改造'],
+  collapsedModules: ['缺陷修复'],
+  writeBackOnDrag: true,
+})
+check(
+  '保存页面配置',
+  savedView.status === 200 && savedView.json?.view?.groupField === '需求类型' && savedView.json.view.filters.length === 2 && savedView.json.view.writeBackOnDrag === true,
+)
+
+const view1 = await call('GET', '/view')
+check(
+  '配置持久化并可读回',
+  view1.json?.view?.listFields?.join(',') === '需求标题,状态,优先级' && view1.json.view.moduleOrder.join(',') === '性能优化,新功能' && view1.json.view.hiddenModules.join(',') === '技术改造',
+)
+
+check('配置写在 view.json', await (async () => {
+  const { readFile } = await import('node:fs/promises')
+  const text = await readFile(join(root, 'view.json'), 'utf8').catch(() => '')
+  return text.includes('需求类型') && text.includes('writeBackOnDrag')
+})())
+
+/* ------------------------------------------------- 前端纯函数（与页面同源） */
+
+console.log('\n[6] 看板/清单的页面能力')
+const { readFile: readClient } = await import('node:fs/promises')
+const clientSource = await readClient(new URL('../lib/client.js', import.meta.url), 'utf8')
+check('客户端包含卡片看板与汇总清单', clientSource.includes('卡片看板') && clientSource.includes('汇总清单') && clientSource.includes('复制清单'))
+check('客户端支持拖拽（卡片 + 模块）', clientSource.includes("type: 'card'") && clientSource.includes("type: 'module'") && clientSource.includes('onDragStart'))
+check('客户端按容器宽度重排（ResizeObserver）', clientSource.includes('ResizeObserver'))
+
+if (!real.json?.error && real.json?.items?.length) {
+  const items = real.json.items
+  const options = (fieldSchema.json?.fields ?? []).find((field) => field.name === '状态')?.options ?? []
+  const withStatus = items.filter((item) => item.fields?.['状态'])
+  const inOptions = withStatus.filter((item) => options.includes(item.fields['状态'])).length
+  check('筛选用到的「状态」选项值与真实数据对得上', options.length > 0 && inOptions === withStatus.length, { options, inOptions, withStatus: withStatus.length, total: items.length })
+}
+
 await rm(root, { recursive: true, force: true })
 
 console.log(`\n结果：PASS ${passed} · WARN ${warned} · FAIL ${failed}`)
