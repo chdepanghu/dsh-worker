@@ -541,12 +541,38 @@ const boardNode = withInjectedState({ 0: tableData, 1: schemaResult, 8: 'board' 
 const boardText = collectText(boardNode).join(' ')
 check('卡片看板按状态分了模块并列出卡片', boardText.includes('待开发') && boardText.includes('已完成') && collectByType(boardNode, 'article').length === 2, boardText.slice(0, 120))
 
+/* 卡片角标：有执行记录的卡片显示状态角标，卡片固定长宽 + 超出省略 */
+
+const byClass = (node, className) => collectByType(node, 'span').filter((entry) => String(entry.props?.className ?? '').includes(className))
+const boardBadges = byClass(boardNode, 'rdw-kcard-badge')
+check('卡片带执行记录角标（已交付）', boardBadges.length === 1 && boardBadges[0].props.className.includes('tone-handed') && collectText(boardBadges[0]).join('').includes('已交付'), boardBadges.map((entry) => entry.props.className))
+check('卡片固定长宽 + 超出省略', (() => {
+  const card = collectByType(boardNode, 'article')[0]
+  return Boolean(card) && clientSource.includes('.rdw-kcard{position:relative;') && clientSource.includes('height:132px;width:216px') && clientSource.includes('-webkit-line-clamp:2')
+})())
+check('执行记录角标口径：最新状态 + 次数', (() => {
+  const runs = [
+    { recordId: 'rec1', at: 100, status: 'handed-off' },
+    { recordId: 'rec1', at: 300, status: 'in-progress' },
+    { recordId: 'rec1', at: 200, status: 'done' },
+  ]
+  const badge = pure.runBadge({ id: 'rec1', title: '技能标签支持 Excel 批量导入' }, runs)
+  const none = pure.runBadge({ id: 'recX', title: '别的需求' }, runs)
+  const byTitle = pure.runBadge({ title: '技能标签支持 Excel 批量导入' }, [{ title: '技能标签支持 Excel 批量导入', status: 'blocked' }])
+  return badge.status === 'in-progress' && badge.label === '进行中' && badge.tone === 'active' && badge.count === 3 && none === null && byTitle.status === 'blocked'
+})(), pure.runBadge({ id: 'rec1', title: '技能标签支持 Excel 批量导入' }, tableProps.runs))
+
 const progressNode = withInjectedState({ 0: tableData, 1: schemaResult, 8: 'progress' }, () => renderComponent('TableModule', tableProps, 'TableModule（有数据·进度）'))
 const progressText = collectText(progressNode).join(' ')
 check('进度视图给出百分比与分桶', progressText.includes('50%') && progressText.includes('已完成') && collectByType(progressNode, 'i').length >= 3, progressText.slice(0, 140))
 
 const detailNode = withInjectedState({ 0: tableData, 1: schemaResult, 5: 'rec1' }, () => renderComponent('TableModule', tableProps, 'TableModule（选中一条·详情）'))
 check('选中一条会渲染详情组件', collectByType(detailNode, components.DetailView).length === 1 && collectByType(detailNode, components.DetailView)[0].props.item.id === 'rec1')
+check('详情是弹窗（遮罩 + role=dialog），带执行记录角标', (() => {
+  const masks = collectByType(detailNode, 'div').filter((entry) => String(entry.props?.className ?? '') === 'rdw-mask')
+  const modals = collectByType(detailNode, 'div').filter((entry) => String(entry.props?.className ?? '') === 'rdw-modal')
+  return masks.length === 1 && modals.length === 1 && modals[0].props.role === 'dialog' && modals[0].props['aria-modal'] === 'true' && collectText(modals[0]).join(' ').includes('已交付')
+})())
 
 /* --------- 自定义框架（customFrame）：顶栏 / 左导航 / 右侧原生对话 --------- */
 
