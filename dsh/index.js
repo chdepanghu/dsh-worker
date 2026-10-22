@@ -10,7 +10,8 @@
  * 不持有任何凭证：一律调用用户本机已登录的 lark-cli。
  */
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { readFile, mkdir, readdir, rm, writeFile, appendFile } from 'node:fs/promises'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
@@ -63,16 +64,49 @@ function runCommand(command, args, { timeoutMs = LARK_TIMEOUT_MS } = {}) {
   })
 }
 
-/** lark-cli 在本机是 .ps1 包装脚本，必须交给 PowerShell 执行。 */
+/** .cmd/.bat 包装脚本里的真实入口（本机 lark-cli 是 node 脚本，见 %dp0%\node_modules\...\run.js）。 */
+function cmdShimTarget(command) {
+  try {
+    const text = readFileSync(command, 'utf8')
+    const match = /%dp0%\\([^"\s]+\.js)/i.exec(text) || /%dp0%\\?([^"\s]+\.js)/i.exec(text)
+    if (!match) return ''
+    const target = resolve(dirname(command), match[1])
+    return existsSync(target) ? target : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * lark-cli 在本机是 .cmd/.ps1 包装。
+ * 能解析到真实 node 入口就直接跑（参数不再被 cmd.exe 重新解释一遍——带引号的 --json 经过 cmd.exe 会卡住），
+ * 解析不到才退回 cmd.exe/PowerShell 包装。
+ */
 function shellWrapper(command) {
   const lower = command.toLowerCase()
   if (lower.endsWith('.ps1')) {
     return { file: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', command] }
   }
   if (lower.endsWith('.cmd') || lower.endsWith('.bat')) {
+    const direct = cmdShimTarget(command)
+    if (direct) {
+      const nodeExe = join(dirname(command), 'node.exe')
+      return {
+        file: existsSync(nodeExe) ? nodeExe : 'node',
+        args: [direct],
+        fallback: { file: 'cmd.exe', args: ['/d', '/s', '/c', command] },
+      }
+    }
     return { file: 'cmd.exe', args: ['/d', '/s', '/c', command] }
   }
   return { file: command, args: [] }
+}
+
+/** 跑 lark-cli：直接跑真身失败（例如找不到 node）时，自动退回包装脚本再试一次。 */
+async function runLark(wrapper, args) {
+  const first = await runCommand(wrapper.file, [...wrapper.args, ...args])
+  if (first.ok || !wrapper.fallback || first.code !== -1) return first
+  return runCommand(wrapper.fallback.file, [...wrapper.fallback.args, ...args])
 }
 
 /** 解析 lark-cli 的位置：先配置、再 PATH（where.exe），最后退回裸名。 */
@@ -159,6 +193,7 @@ const DEFAULT_VIEW = {
   groupField: '状态', // 卡片看板按哪个字段分模块
   cardSummaryField: '', // 卡片上展示的内容字段（空 = 原始需求）
   listFields: [], // 汇总清单显示的列（空 = 自动挑）
+  cardFields: [], // 卡片上展示的字段（空 = 状态/负责人/优先级/期望完成时间）
   moduleOrder: [], // 模块手工排序
   hiddenModules: [], // 隐藏的模块
   collapsedModules: [], // 折叠的模块
@@ -177,7 +212,7 @@ function sanitizeTableSlice(slice) {
   for (const key of ['groupField', 'cardSummaryField']) {
     if (typeof slice[key] === 'string') out[key] = slice[key]
   }
-  for (const key of ['listFields', 'moduleOrder', 'hiddenModules', 'collapsedModules']) {
+  for (const key of ['listFields', 'cardFields', 'moduleOrder', 'hiddenModules', 'collapsedModules']) {
     if (Array.isArray(slice[key])) out[key] = asStringArray(slice[key])
   }
   if (typeof slice.writeBackOnDrag === 'boolean') out.writeBackOnDrag = slice.writeBackOnDrag
@@ -223,13 +258,14 @@ async function readView(config) {
             .map((item) => ({ field: item.field, values: asStringArray(item.values), text: String(item.text ?? '') }))
         : [],
       listFields: asStringArray(source.listFields),
+    cardFields: asStringArray(source.cardFields),
       moduleOrder: asStringArray(source.moduleOrder),
       hiddenModules: asStringArray(source.hiddenModules),
       collapsedModules: asStringArray(source.collapsedModules),
       writeBackOnDrag: Boolean(source.writeBackOnDrag),
     }
   } catch {
-    return { ...DEFAULT_VIEW, modules: [], tables: {}, filters: [], listFields: [], moduleOrder: [], hiddenModules: [], collapsedModules: [] }
+    return { ...DEFAULT_VIEW, modules: [], tables: {}, filters: [], listFields: [], cardFields: [], moduleOrder: [], hiddenModules: [], collapsedModules: [] }
   }
 }
 
@@ -254,6 +290,7 @@ async function writeView(config, patch) {
   if (typeof patch?.groupField === 'string') next.groupField = patch.groupField
   if (typeof patch?.cardSummaryField === 'string') next.cardSummaryField = patch.cardSummaryField
   if (Array.isArray(patch?.listFields)) next.listFields = asStringArray(patch.listFields)
+  if (Array.isArray(patch?.cardFields)) next.cardFields = asStringArray(patch.cardFields)
   if (Array.isArray(patch?.moduleOrder)) next.moduleOrder = asStringArray(patch.moduleOrder)
   if (Array.isArray(patch?.hiddenModules)) next.hiddenModules = asStringArray(patch.hiddenModules)
   if (Array.isArray(patch?.collapsedModules)) next.collapsedModules = asStringArray(patch.collapsedModules)
@@ -372,7 +409,7 @@ async function fetchTableRecords(config, table, { fresh = false, limit = 2000 } 
   const pullDir = join(config.root, 'pull')
   await mkdir(pullDir, { recursive: true })
   const outFile = join(pullDir, `${String(table.tableId).replace(/[^\w.-]/g, '_') || 'records'}.ndjson`)
-  const ndjson = await runCommand(wrapper.file, [...wrapper.args, ...common, '--limit', String(limit), '--format', 'ndjson', '--output', outFile, '--overwrite'])
+  const ndjson = await runLark(wrapper, [...common, '--limit', String(limit), '--format', 'ndjson', '--output', outFile, '--overwrite'])
   // 退出码不可全信：.cmd 包装下 lark-cli 会以非 0 退出，但 ndjson 文件其实写好了。以文件里的记录为准。
   const ndjsonText = await readFile(outFile, 'utf8').catch(() => '')
   await rm(outFile, { force: true }).catch(() => {})
@@ -387,7 +424,7 @@ async function fetchTableRecords(config, table, { fresh = false, limit = 2000 } 
   }
   if (!records.length) {
     fetchMode = 'json'
-    const json = await runCommand(wrapper.file, [...wrapper.args, ...common, '--limit', '200', '--format', 'json'])
+    const json = await runLark(wrapper, [...common, '--limit', '200', '--format', 'json'])
     if (!json.ok) {
       return {
         ok: false,
@@ -822,8 +859,7 @@ async function matrixToRecords(wrapper, source, stdout) {
   if (inline.length) return { records: inline, aligned: true, reason: `按返回体自带的 ${names.length} 个字段名对齐` }
 
   // 没有自带字段名时，才退回 +field-list 并用选项值校正列顺序。
-  const listed = await runCommand(wrapper.file, [
-    ...wrapper.args,
+  const listed = await runLark(wrapper, [
     'base',
     '+field-list',
     '--base-token',
@@ -885,7 +921,7 @@ async function fetchRequirements(config, settings) {
   await mkdir(pullDir, { recursive: true })
   const outFile = join(pullDir, `${String(source.tableId).replace(/[^\w.-]/g, '_') || 'records'}.ndjson`)
 
-  const ndjson = await runCommand(wrapper.file, [...wrapper.args, ...common, '--limit', '2000', '--format', 'ndjson', '--output', outFile, '--overwrite'])
+  const ndjson = await runLark(wrapper, [...common, '--limit', '2000', '--format', 'ndjson', '--output', outFile, '--overwrite'])
   // 同上：.cmd 包装下退出码可能非 0，但文件里有记录就照样用。
   const ndjsonText = await readFile(outFile, 'utf8').catch(() => '')
   await rm(outFile, { force: true }).catch(() => {})
@@ -900,7 +936,7 @@ async function fetchRequirements(config, settings) {
   }
   if (!records.length) {
     fetchMode = 'json'
-    const json = await runCommand(wrapper.file, [...wrapper.args, ...common, '--limit', '200', '--format', 'json'])
+    const json = await runLark(wrapper, [...common, '--limit', '200', '--format', 'json'])
     if (!json.ok) {
       return {
         configured: true,
@@ -931,6 +967,24 @@ async function fetchRequirements(config, settings) {
   return { configured: true, items, count: items.length, source: described, fetchMode, warning }
 }
 
+/** 单元格值的写法按字段类型来（单选/多选要数组，勾选是布尔，数字不加引号）。 */
+export function cellValueFor(value, fieldType = '') {
+  const type = String(fieldType ?? '').toLowerCase()
+  if (value === null || value === undefined || value === '') return null
+  if (type.includes('checkbox') || type.includes('check')) return value === true || value === 'true' || value === '是'
+  if (type.includes('number') || type.includes('currency') || type.includes('percent') || type.includes('rating') || type === 'num') {
+    const number = Number(value)
+    return Number.isFinite(number) ? number : String(value)
+  }
+  if (type.includes('select')) return Array.isArray(value) ? value : [value]
+  return Array.isArray(value) ? value : String(value)
+}
+
+/** 回写用 +record-batch-update：一次一条记录一个字段。 */
+export function buildBatchUpdatePayload(recordId, field, value, fieldType) {
+  return { update_records: { [String(recordId)]: { [String(field)]: cellValueFor(value, fieldType) } } }
+}
+
 async function updateRequirementStatus(config, settings, body) {
   const source = await resolveRequirementsSource(config, settings)
   if (!source.configured) return { ok: false, error: '还未配置飞书多维表格' }
@@ -938,33 +992,50 @@ async function updateRequirementStatus(config, settings, body) {
   const status = String(body?.status ?? '').trim()
   if (!recordId || !status) return { ok: false, error: '缺少记录 ID 或状态值' }
   const statusField = String(body?.field ?? '').trim() || settings.statusField || source.fieldMap?.status || '状态'
+  const fieldType = String(body?.fieldType ?? '').trim() || (await cachedFieldType(config, source.tableId, statusField))
+  const payload = buildBatchUpdatePayload(recordId, statusField, status, fieldType)
   const larkCli = await resolveLarkCli(config.larkCli)
   const wrapper = shellWrapper(larkCli)
+  // 带引号的 JSON 经过 cmd.exe / PowerShell 包装会被再解释一遍，所以走 --json @文件；
+  // lark-cli 只允许读当前目录、系统临时目录或 ~/files 下的文件。
+  const payloadFile = join(tmpdir(), `dsh-rdw-write-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`)
+  await writeFile(payloadFile, JSON.stringify(payload), 'utf8')
   const args = [
-    ...wrapper.args,
     'base',
-    '+record-update',
+    '+record-batch-update',
     '--base-token',
     source.baseToken,
     '--table-id',
     source.tableId,
-    '--record-id',
-    recordId,
-    '--fields-json',
-    JSON.stringify({ [statusField]: status }),
+    '--json',
+    `@${payloadFile}`,
     '--as',
     source.identity,
   ]
-  const result = await runCommand(wrapper.file, args)
+  if (body?.dryRun) args.push('--dry-run')
+  const result = await runLark(wrapper, args)
+  await rm(payloadFile, { force: true }).catch(() => {})
   if (!result.ok) {
     return {
       ok: false,
       error: '回写飞书失败',
       detail: (result.stderr || result.stdout || '').trim().slice(0, 1500),
-      hint: `按本机 lark-cli 的实际参数名调整（当前用 --fields-json，字段名「${statusField}」）`,
+      command: `lark-cli base +record-batch-update --base-token ${source.baseToken} --table-id ${source.tableId} --json '${JSON.stringify(payload)}' --as ${source.identity}`,
+      hint: '本机 lark-cli 写回用 +record-batch-update；字段名与选项值必须和表里完全一致。',
     }
   }
-  return { ok: true, field: statusField, status }
+  return { ok: true, field: statusField, status, payload, dryRun: Boolean(body?.dryRun), result: (result.stdout || '').trim().slice(0, 400) }
+}
+
+/** 从缓存的字段清单里查某个字段的类型（拿不到就返回空，值按字符串写）。 */
+async function cachedFieldType(config, tableId, fieldName) {
+  try {
+    const text = await readFile(fieldSchemaFile(config, tableId), 'utf8')
+    const fields = parseFieldSchema(text)
+    return fields.find((field) => field.name === fieldName)?.type ?? ''
+  } catch {
+    return ''
+  }
 }
 
 /* --------------------------------------------------------- 表结构（字段） */
@@ -1009,8 +1080,7 @@ async function fetchFieldSchema(config, settings, explicitTable) {
   }
   const larkCli = await resolveLarkCli(config.larkCli)
   const wrapper = shellWrapper(larkCli)
-  const result = await runCommand(wrapper.file, [
-    ...wrapper.args,
+  const result = await runLark(wrapper, [
     'base',
     '+field-list',
     '--base-token',
@@ -1159,19 +1229,28 @@ function sendJson(res, status, payload) {
 function readBody(req) {
   return new Promise((resolvePromise) => {
     let data = ''
+    let settled = false
+    const done = (payload) => {
+      if (settled) return
+      settled = true
+      resolvePromise(payload)
+    }
+    const parse = () => {
+      if (!data) return {}
+      try {
+        return JSON.parse(data)
+      } catch {
+        return {}
+      }
+    }
     req.on('data', (chunk) => {
       data += chunk
       if (data.length > 1024 * 1024) req.destroy()
     })
-    req.on('end', () => {
-      if (!data) return resolvePromise({})
-      try {
-        resolvePromise(JSON.parse(data))
-      } catch {
-        resolvePromise({})
-      }
-    })
-    req.on('error', () => resolvePromise({}))
+    req.on('end', () => done(parse()))
+    // 客户端半路断开时也别把请求挂死
+    req.on('close', () => done(parse()))
+    req.on('error', () => done({}))
   })
 }
 

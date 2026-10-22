@@ -12,7 +12,7 @@ import { EventEmitter } from 'node:events'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, alignMatrixColumns, matrixShape, normalizeRecord, parseBaseInput, parseLarkRecords, recordsFromMatrix } from '../dsh/index.js'
+import { apply, alignMatrixColumns, buildBatchUpdatePayload, cellValueFor, matrixShape, normalizeRecord, parseBaseInput, parseLarkRecords, recordsFromMatrix } from '../dsh/index.js'
 
 const LARK = process.env.RDW_LARK_CLI || 'D:\\soft\\nodejs\\lark-cli.ps1'
 const BASE_TOKEN = process.env.RDW_TEST_BASE || 'I3YnbPQp6awaxWsC1FZc8v89nyc'
@@ -171,15 +171,15 @@ async function call(method, path, body) {
     },
   }
   const done = handler(req, res)
-  if (body !== undefined) {
-    setImmediate(() => {
-      req.emit('data', JSON.stringify(body))
-      req.emit('end')
-    })
-  } else {
-    setImmediate(() => req.emit('end'))
-  }
+  // 有些路由先 await 读设置、之后才挂 'data'/'end' 监听；body 必须在响应结束前反复补发，
+  // 否则早发的 data/end 会丢，请求就永远等不到（真机 HTTP 不会这样）。
+  const payload = body === undefined ? '' : JSON.stringify(body)
+  const pump = setInterval(() => {
+    if (payload) req.emit('data', payload)
+    req.emit('end')
+  }, 15)
   await done
+  clearInterval(pump)
   let json = null
   try {
     json = JSON.parse(res.body)
@@ -546,9 +546,16 @@ check('卡片看板按状态分了模块并列出卡片', boardText.includes('�
 const byClass = (node, className) => collectByType(node, 'span').filter((entry) => String(entry.props?.className ?? '').includes(className))
 const boardBadges = byClass(boardNode, 'rdw-kcard-badge')
 check('卡片带执行记录角标（已交付）', boardBadges.length === 1 && boardBadges[0].props.className.includes('tone-handed') && collectText(boardBadges[0]).join('').includes('已交付'), boardBadges.map((entry) => entry.props.className))
-check('卡片固定长宽 + 超出省略', (() => {
+check('卡片固定长宽 + 配置字段一行一个', (() => {
   const card = collectByType(boardNode, 'article')[0]
-  return Boolean(card) && clientSource.includes('.rdw-kcard{position:relative;') && clientSource.includes('height:132px;width:216px') && clientSource.includes('-webkit-line-clamp:2')
+  return (
+    Boolean(card) &&
+    clientSource.includes('.rdw-kcard{position:relative;') &&
+    clientSource.includes('height:152px;width:216px') &&
+    clientSource.includes('-webkit-line-clamp:2') &&
+    clientSource.includes('.rdw-card-field-value{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}') &&
+    collectByType(card, 'div').filter((entry) => String(entry.props?.className ?? '') === 'rdw-card-field').length > 0
+  )
 })())
 check('执行记录角标口径：最新状态 + 次数', (() => {
   const runs = [
@@ -687,6 +694,50 @@ if (taskRecords.json?.error) {
 
 const taskSchema = await call('GET', `/fields?table=${encodeURIComponent('task:dahua-skill-service')}`)
 check('读开发任务表的表结构', taskSchema.status === 200 && (taskSchema.json?.fields?.length ?? 0) > 0, (taskSchema.json?.fields ?? []).map((field) => field.name).slice(0, 6))
+
+/* 回写飞书：命令名/参数必须和本机 lark-cli 对得上（用 --dry-run 验证，不真的写） */
+
+check('回写用 +record-batch-update 的批量结构', (() => {
+  const payload = buildBatchUpdatePayload('recA', '状态', '已领取', 'singleSelect')
+  return (
+    Array.isArray(payload.update_records.recA['状态']) &&
+    payload.update_records.recA['状态'][0] === '已领取' &&
+    cellValueFor('12.5', 'number') === 12.5 &&
+    cellValueFor(true, 'checkbox') === true &&
+    cellValueFor('', 'singleSelect') === null
+  )
+})(), buildBatchUpdatePayload('recA', '状态', '已领取', 'singleSelect'))
+
+const requirementRecords = await call('GET', `/records?table=${encodeURIComponent('requirement:dahua-skill-service')}`)
+const writeRecord = requirementRecords.json?.items?.[0]
+if (!writeRecord?.id) {
+  warn('拿不到真实记录 ID，跳过回写 dry-run 检查', requirementRecords.json?.error ?? requirementRecords.json?.warning ?? '')
+} else {
+  const dry = await call('POST', '/requirement/status', {
+    recordId: writeRecord.id,
+    status: String(writeRecord.status || '待开发'),
+    field: '状态',
+    fieldType: 'singleSelect',
+    dryRun: true,
+  })
+  check(
+    '回写命令被本机 lark-cli 接受（--dry-run，未真的写）',
+    dry.status === 200 && dry.json?.ok === true && dry.json?.dryRun === true,
+    { status: dry.status, detail: String(dry.json?.detail ?? '').slice(0, 300), command: dry.json?.command },
+  )
+}
+
+/* 卡片字段可配置（按表持久化） */
+
+const cardFieldPatch = await call('POST', '/view', { tables: { 'requirement:dahua-skill-service': { cardFields: ['状态', '负责人'] } } })
+check('卡片字段配置可保存', cardFieldPatch.status === 200, cardFieldPatch.json?.view?.tables?.['requirement:dahua-skill-service'])
+const viewBack = await call('GET', '/view')
+check(
+  '卡片字段配置按表读回',
+  (viewBack.json?.view?.tables?.['requirement:dahua-skill-service']?.cardFields ?? []).join(',') === '状态,负责人',
+  viewBack.json?.view?.tables?.['requirement:dahua-skill-service'],
+)
+check('客户端有卡片字段配置入口与确认回写', clientSource.includes('卡片上展示哪些字段') && clientSource.includes('确认写回飞书'))
 
 const overview = await call('GET', '/overview')
 check('/overview 汇总两张表', overview.status === 200 && Array.isArray(overview.json?.tables) && overview.json.tables.length === 2, overview.json?.tables?.map((table) => ({ key: table.key, total: table.total, error: table.error })))
