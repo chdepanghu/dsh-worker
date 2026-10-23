@@ -1278,6 +1278,11 @@ check(
   !applyThrew && slotInjected.includes('conversation.input.left') && slotRegistrations[0]?.meta?.id === 'rdw-expert-entry' && slotRegistrations[0]?.meta?.name === 'conversation.input.left',
   { injected: slotInjected, meta: slotRegistrations[0]?.meta },
 )
+check(
+  '入口排在最左端（对齐 WorkBuddy：order 取小值，不动宿主原生控件）',
+  Number(slotRegistrations[0]?.meta?.order) < 40 && typeof slotRegistrations[0]?.meta?.label === 'function',
+  slotRegistrations[0]?.meta?.order,
+)
 const slotEntryElement = slotRegistrations[0]?.render?.({ inputActions: entryInputActions })
 check(
   '宿主渲染这个入口时，拿到的是专家入口组件（并带着宿主给的 inputActions）',
