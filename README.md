@@ -19,7 +19,7 @@ DSH Desktop 工作台：**跨多张飞书多维表格看开发任务、进度与
 │ 开发任务 · … ✎│                                                │
 │ 技能与规范    │                                                │
 │ ＋ 添加模块   │                                                │
-│ v3.5.0        │                                                │
+│ v3.6.0        │                                                │
 │ 收起工作台    │                                                │
 └───────────────┴────────────────────────────────────────────────┘
        ↑ 拖这条边改宽度（120~380，双击恢复 168）
@@ -53,14 +53,42 @@ DSH Desktop 工作台：**跨多张飞书多维表格看开发任务、进度与
 
 每次点「生成开发指令并复制」，工作台就往 `runs.jsonl` 追加一条记录：哪条需求/任务、哪张表、哪个项目、什么时候、什么备注。在总览或条目详情里可以把状态标成 `已交付 / 进行中 / 已完成 / 受阻`（事件追加写入，历史可查）。
 
+## 项目开发（AI 开发任务进度）
+
+左侧导航里与 `总览` 并列的内置模块，把**开发任务表**的状态和工作台自己的 **AI 执行记录**合成一张进度视图：
+
+- **任务进度**：按任务表的状态字段分桶（待开发 / 开发中 / 已完成 …）+ 整体完成度进度条；
+- **AI 开发进度**：已交付 / 进行中 / 已完成 / 受阻 / 还没交给 AI，各自多少条（来自 `runs.jsonl`，按记录 id 或标题归到每条任务）；
+- **任务清单**：编号 / 标题 / 状态 / 模块或负责人 / AI 最新状态角标（带次数）/ 最近更新时间；**点一行 = 复制这条任务的开发指令**，直接贴给 AI；
+- 任务表还没记录（或完全没有执行记录）时，直接列出「最近 AI 执行记录」，不会给一片空白。
+
+## 技能与规范
+
+一个模块里看四类来源，并**可以按来源和目录约定筛选**：
+
+| 范围 | 目录 |
+| --- | --- |
+| DeepSeek Harness（跨项目通用） | `DSH_HOME/skills` |
+| 全局（用户级） | `~/.agents/skills`、`~/.claude/skills`、`~/.codex/skills`、`~/.gemini/skills`、`~/.cursor/skills`、`~/.cc-switch/skills`、`~/.opencode/skills`、`~/skills`（`DSH_AGENTS_HOME` 等环境变量可改根） |
+| 项目 | 所选项目下的 `.dsh`、`.agents`、`.agent`、`.claude`、`.codex`、`.code`、`.cursor`、`.gemini`、`.github`、`.opencode`、`skills` 各自的 `/skills` |
+| 自定义 | 主机配置 / 工作台设置里加的目录 |
+
+- 筛选四层可叠加：**范围**（全部 / DeepSeek Harness / 全局 / 项目 / 自定义，带条数）→ **目录约定**（`.claude`、`.codex`…）→ **类型**（技能 / 角色规范 / 项目规范文档）→ **关键词**；
+- 每个来源目录都会标出**是否命中**（✓ 有 / × 没有），没建的目录也列出来，方便知道还能往哪放；
+- 除了 `<目录>/skills/<名>/SKILL.md`，`<目录>/agents/*.md` 这类**角色 / 规范文件**也会按 `kind=agent` 扫出来；再加上项目里的 `doc/standards/*.md`、`AGENTS.md`、`CLAUDE.md`；
+- 点左边任一条 → 右边直接看正文（只读，不允许读工作台范围外的路径）。
+
+**新建技能**（`＋ 新建技能`）：填名称（自动归一成 kebab-case）、一句话描述、使用场景、步骤、注意/红线，默认写进 **DeepSeek Harness 通用技能根**（`DSH_HOME/skills/<名>/SKILL.md`，任何项目都能用），也可以选「只放当前项目」（写进 `<项目>/.claude/skills`）。重名会拦住并提示，确认覆盖才重建；技能名里的路径字符会被去掉，写不出目录之外。
+
 ## 怎么用
 
 1. 打开工作台 → 先看 `总览`：项目里已有的表会被自动认出（`.requirement-sources.json`、`.dev-task-sources.json`），不需要重填表格地址。
 2. 进某张表的模块 → 用「汇总清单 / 卡片看板 / 进度」看这一轮要做什么、做到哪了。
 3. 点一条记录 → 详情（原始需求 / 详细设计 / 验收标准分块展示）→ 「生成开发指令并复制」。
 4. 把指令粘到左侧 AI 对话，AI 就在该项目里按已有规范/skill 做前后端开发。
-5. 需要的话点「待开发/开发中/已完成」或直接用拖拽把状态回写飞书表格。
-6. `技能与规范` 模块扫描全局 skill（`DSH_HOME/skills`）与所选项目的 `.claude/skills`、`.agents/skills`、`skills`，以及 `doc/standards/*.md`、`AGENTS.md`、`CLAUDE.md`。
+5. 盯进度就去 `项目开发`：任务状态分桶 + 每条任务的 AI 执行状态。
+6. 需要的话点「待开发/开发中/已完成」或直接用拖拽把状态回写飞书表格。
+7. `技能与规范` 里按范围/目录筛选现有技能，缺规范就当场新建一个跨项目通用的。
 
 ## 读表方式
 
@@ -72,7 +100,7 @@ DSH Desktop 工作台：**跨多张飞书多维表格看开发任务、进度与
 ## 本机接口
 
 都在本工作台自己的前缀下：
-`/api/requirement-dev-workbench/{state,settings,sources,requirements,requirement/status,tables,records,fields,overview,view,runs,runs/status,skills,skill}`。
+`/api/requirement-dev-workbench/{state,settings,sources,requirements,requirement/status,tables,records,fields,overview,view,runs,runs/status,skills,skills/create,skill}`。
 其中 `/records`、`/fields`、`/requirements` 都支持 `?table=<表 key>` 指定表。
 
 ## 身份说明

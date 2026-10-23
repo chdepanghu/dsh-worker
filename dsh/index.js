@@ -1145,23 +1145,121 @@ function parseFrontmatter(text) {
   return out
 }
 
-async function collectSkillsInRoot(root, group, items) {
-  const entries = await readdir(root, { withFileTypes: true }).catch(() => [])
+/** 技能目录：技能本体 + 同名目录下的角色/规范文件（.claude/agents/*.md 这类）。 */
+async function collectSkillsInRoot(root, items) {
+  const entries = await readdir(root.path, { withFileTypes: true }).catch(() => [])
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue
-    const file = join(root, entry.name, 'SKILL.md')
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue
+    const file = join(root.path, entry.name, 'SKILL.md')
     const text = await readFile(file, 'utf8').catch(() => null)
     if (text === null) continue
     const front = parseFrontmatter(text)
     items.push({
-      group,
-      id: `${group}:${entry.name}`,
+      kind: 'skill',
+      scope: root.scope,
+      convention: root.convention,
+      rootPath: root.path,
+      group: root.label,
+      id: `${root.label}:${entry.name}`,
       name: front.name || entry.name,
+      dirName: entry.name,
       description: front.description || '',
       path: file,
       chars: text.length,
     })
   }
+  const agentsDir = join(dirname(root.path), 'agents')
+  const agentEntries = await readdir(agentsDir, { withFileTypes: true }).catch(() => [])
+  for (const entry of agentEntries) {
+    if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.md')) continue
+    const file = join(agentsDir, entry.name)
+    const text = await readFile(file, 'utf8').catch(() => null)
+    if (text === null) continue
+    const front = parseFrontmatter(text)
+    items.push({
+      kind: 'agent',
+      scope: root.scope,
+      convention: root.convention,
+      rootPath: agentsDir,
+      group: `${root.label} · 角色/规范`,
+      id: `agent:${file}`,
+      name: front.name || entry.name.replace(/\.md$/i, ''),
+      dirName: entry.name.replace(/\.md$/i, ''),
+      description: front.description || '',
+      path: file,
+      chars: text.length,
+    })
+  }
+}
+
+/** DeepSeek Harness 通用技能根（跨项目可用）；没有就返回空。 */
+function harnessSkillDir() {
+  const dshHome = process.env.DSH_HOME
+  return dshHome ? join(dshHome, 'skills') : ''
+}
+
+/** 技能名统一成 kebab-case，顺带挡掉路径穿越。 */
+export function slugifySkillName(value) {
+  return String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_]+/g, '-')
+    .replace(/[^a-z0-9-]/g, '')
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48)
+}
+
+/** 生成一份能直接被 DSH 识别的 SKILL.md（frontmatter + 正文）。 */
+export function renderSkillMarkdown({ name, description, whenToUse = '', steps = [], notes = [] }) {
+  const lines = ['---', `name: ${name}`, `description: ${String(description).replace(/\s+/g, ' ').trim()}`, '---', '', `# ${name}`, '']
+  lines.push('## 什么时候用', '', whenToUse || String(description).trim() || '（补一句：什么场景下该用这个技能）', '')
+  lines.push('## 怎么做', '')
+  const stepLines = (steps ?? []).map((line) => String(line).trim()).filter(Boolean)
+  if (stepLines.length) for (const [index, line] of stepLines.entries()) lines.push(`${index + 1}. ${line}`)
+  else lines.push('1. （写下这个技能的固定步骤）')
+  lines.push('', '## 注意', '')
+  const noteLines = (notes ?? []).map((line) => String(line).trim()).filter(Boolean)
+  if (noteLines.length) for (const line of noteLines) lines.push(`- ${line}`)
+  else lines.push('- （写下易错点/红线）')
+  return `${lines.join('\n')}\n`
+}
+
+/** 新建技能：默认写进 DeepSeek Harness 通用技能根，也可以写进当前项目的 .claude/skills。 */
+async function createSkill(config, settings, body) {
+  const name = slugifySkillName(body?.name)
+  if (!name) return { ok: false, error: '技能名称请用小写字母、数字和连字符（例如 java-code-review）' }
+  const description = String(body?.description ?? '').trim()
+  if (!description) return { ok: false, error: '请写一句技能描述（AI 靠它判断什么时候用这个技能）' }
+  const scope = body?.scope === 'project' ? 'project' : 'harness'
+  let dir = ''
+  if (scope === 'project') {
+    const projectDir = String(settings.projectDir ?? '').trim()
+    if (!projectDir) return { ok: false, error: '还没选项目目录，先选一个再创建项目内技能' }
+    dir = join(projectDir, '.claude', 'skills', name)
+  } else {
+    const root = harnessSkillDir()
+    if (!root) return { ok: false, error: '取不到 DSH_HOME，定位不到 DeepSeek Harness 技能目录' }
+    dir = join(root, name)
+  }
+  const file = join(dir, 'SKILL.md')
+  if (existsSync(file) && !body?.overwrite) {
+    return { ok: false, error: `技能「${name}」已存在，换个名字或先删掉它`, path: file, exists: true }
+  }
+  const text = renderSkillMarkdown({
+    name,
+    description,
+    whenToUse: String(body?.whenToUse ?? '').trim(),
+    steps: String(body?.steps ?? '').split('\n'),
+    notes: String(body?.notes ?? '').split('\n'),
+  })
+  try {
+    await mkdir(dir, { recursive: true })
+    await writeFile(file, text, 'utf8')
+  } catch (error) {
+    return { ok: false, error: `写技能文件失败：${String(error?.message ?? error)}`, path: file }
+  }
+  return { ok: true, name, scope, path: file, dir, chars: text.length, overwrote: Boolean(body?.overwrite) }
 }
 
 async function collectDocs(projectDir, items) {
@@ -1179,35 +1277,96 @@ async function collectDocs(projectDir, items) {
   }
 }
 
+/** 项目内的技能目录约定：与 DSH 技能管理器的项目来源一致，另加 .agent / .code 两个别名。 */
+const SKILL_CONVENTIONS = [
+  { dir: '.dsh', label: '.dsh（本项目专用）' },
+  { dir: '.agents', label: '.agents' },
+  { dir: '.agent', label: '.agent' },
+  { dir: '.claude', label: '.claude' },
+  { dir: '.codex', label: '.codex' },
+  { dir: '.code', label: '.code' },
+  { dir: '.cursor', label: '.cursor' },
+  { dir: '.gemini', label: '.gemini' },
+  { dir: '.github', label: '.github' },
+  { dir: '.opencode', label: '.opencode' },
+  { dir: '', label: 'skills' },
+]
+
+/** 用户级（全局）技能目录：环境变量可以改根，和 DSH 技能管理器保持一致。 */
+function globalSkillDirs() {
+  const home = process.env.USERPROFILE || process.env.HOME || ''
+  if (!home) return []
+  const pick = (envName, fallback) => process.env[envName] || join(home, fallback)
+  return [
+    { convention: '.agents', label: '全局 skill · .agents（公共 Agent）', path: join(pick('DSH_AGENTS_HOME', '.agents'), 'skills') },
+    { convention: '.claude', label: '全局 skill · .claude（Claude）', path: join(pick('DSH_CLAUDE_HOME', '.claude'), 'skills') },
+    { convention: '.codex', label: '全局 skill · .codex（Codex）', path: join(pick('DSH_CODEX_HOME', '.codex'), 'skills') },
+    { convention: '.gemini', label: '全局 skill · .gemini（Gemini）', path: join(pick('DSH_GEMINI_HOME', '.gemini'), 'skills') },
+    { convention: '.cursor', label: '全局 skill · .cursor', path: join(home, '.cursor', 'skills') },
+    { convention: '.cc-switch', label: '全局 skill · .cc-switch', path: join(home, '.cc-switch', 'skills') },
+    { convention: '.opencode', label: '全局 skill · .opencode', path: join(home, '.opencode', 'skills') },
+    { convention: 'skills', label: '全局 skill · 用户 skills 目录', path: join(home, 'skills') },
+  ]
+}
+
 function skillRootsFor(config, settings) {
   const roots = []
-  const push = (label, path) => {
+  const push = (scope, convention, label, path, note = '') => {
     if (!path) return
-    if (roots.some((root) => root.path === path)) return
-    roots.push({ label, path })
+    const key = resolve(path).toLowerCase()
+    if (roots.some((root) => resolve(root.path).toLowerCase() === key)) return
+    roots.push({ scope, convention, label, path, note, exists: existsSync(path) })
   }
-  const dshHome = process.env.DSH_HOME
-  if (dshHome) {
-    push('全局 skill', join(dshHome, 'skills'))
-  }
+  // 1) DeepSeek Harness 自己的技能根：跨项目通用，也是「新建技能」默认写入的位置
+  const harness = harnessSkillDir()
+  if (harness) push('harness', '', 'DeepSeek Harness · 通用技能', harness, 'DSH 全局技能根，任何项目都能用')
+  // 2) 全局（用户级）约定目录
+  for (const entry of globalSkillDirs()) push('global', entry.convention, entry.label, entry.path)
+  // 3) 项目内约定目录
   const projectDir = settings.projectDir
   if (projectDir) {
-    push('项目 skill (.claude)', join(projectDir, '.claude', 'skills'))
-    push('项目 skill (.agents)', join(projectDir, '.agents', 'skills'))
-    push('项目 skill (skills)', join(projectDir, 'skills'))
+    for (const convention of SKILL_CONVENTIONS) {
+      const path = convention.dir ? join(projectDir, convention.dir, 'skills') : join(projectDir, 'skills')
+      push('project', convention.dir || 'skills', `项目 skill · ${convention.label}`, path)
+    }
   }
-  for (const extra of config.skillsRoots ?? []) push('自定义 skill', extra)
-  for (const extra of settings.skillsRoots ?? []) push('自定义 skill', extra)
+  // 4) 自定义目录（主机配置或工作台设置里加的）
+  for (const extra of config.skillsRoots ?? []) push('custom', '', '自定义 skill', extra)
+  for (const extra of settings.skillsRoots ?? []) push('custom', '', '自定义 skill', extra)
   return roots
 }
 
 async function listSkills(config, settings) {
   const roots = skillRootsFor(config, settings)
   const items = []
-  for (const root of roots) await collectSkillsInRoot(root.path, root.label, items)
+  for (const root of roots) {
+    if (!root.exists) continue
+    await collectSkillsInRoot(root, items)
+  }
   const docs = []
   await collectDocs(settings.projectDir, docs)
-  return { roots, items, docs, projectDir: settings.projectDir }
+  const summary = {}
+  for (const scope of ['harness', 'global', 'project', 'custom']) summary[scope] = { scope, roots: 0, exists: 0, skills: 0, agents: 0 }
+  for (const root of roots) {
+    const bucket = summary[root.scope]
+    if (!bucket) continue
+    bucket.roots += 1
+    if (root.exists) bucket.exists += 1
+  }
+  for (const item of items) {
+    const bucket = summary[item.scope]
+    if (!bucket) continue
+    if (item.kind === 'agent') bucket.agents += 1
+    else bucket.skills += 1
+  }
+  return {
+    roots,
+    items,
+    docs,
+    projectDir: settings.projectDir,
+    harnessSkillDir: harnessSkillDir(),
+    summary: Object.values(summary),
+  }
 }
 
 async function readSkillFile(config, settings, target) {
@@ -1456,6 +1615,13 @@ export function apply(ctx, config) {
       if (route === '/skills' && req.method === 'GET') {
         const settings = await readSettings(config)
         return sendJson(res, 200, await listSkills(config, settings))
+      }
+
+      if (route === '/skills/create' && req.method === 'POST') {
+        const settings = await readSettings(config)
+        const body = await readBody(req)
+        const result = await createSkill(config, settings, body)
+        return sendJson(res, result.ok ? 200 : 400, result)
       }
 
       if (route === '/skill' && req.method === 'GET') {

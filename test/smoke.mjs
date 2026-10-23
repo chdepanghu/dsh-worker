@@ -12,7 +12,7 @@ import { EventEmitter } from 'node:events'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, alignMatrixColumns, buildBatchUpdatePayload, cellValueFor, matrixShape, normalizeRecord, parseBaseInput, parseLarkRecords, recordsFromMatrix } from '../dsh/index.js'
+import { apply, alignMatrixColumns, buildBatchUpdatePayload, cellValueFor, matrixShape, normalizeRecord, parseBaseInput, parseLarkRecords, recordsFromMatrix, renderSkillMarkdown, slugifySkillName } from '../dsh/index.js'
 
 const LARK = process.env.RDW_LARK_CLI || 'D:\\soft\\nodejs\\lark-cli.ps1'
 const BASE_TOKEN = process.env.RDW_TEST_BASE || 'I3YnbPQp6awaxWsC1FZc8v89nyc'
@@ -248,6 +248,130 @@ check('扫到项目 skill 并解析出 frontmatter 描述', skillNames.includes(
 check('扫到规范文档', (scanned.json?.docs ?? []).some((doc) => doc.name === '03-coding'), (scanned.json?.docs ?? []).map((d) => d.name))
 const readable = await call('GET', `/skill?path=${encodeURIComponent(join(projectDir, '.claude', 'skills', 'feature-dev', 'SKILL.md'))}`)
 check('能读出 skill 正文', readable.status === 200 && String(readable.json?.text ?? '').includes('# feature-dev'))
+
+/* 技能来源分四种范围（harness / 全局 / 项目 / 自定义），每种的目录约定都要认出来 */
+
+await (async () => {
+  const { mkdir } = await import('node:fs/promises')
+  const specs = [
+    ['.agents', 'skills', 'agent-conventions', '团队约定技能'],
+    ['.codex', 'skills', 'codex-review', 'Codex 评审技能'],
+    ['.cursor', 'skills', 'cursor-hint', 'Cursor 提示技能'],
+    ['', 'skills', 'plain-skill', '裸 skills 目录技能'],
+  ]
+  for (const [dir, sub, slug, description] of specs) {
+    const target = dir ? join(projectDir, dir, sub, slug) : join(projectDir, sub, slug)
+    await mkdir(target, { recursive: true })
+    await writeFile(join(target, 'SKILL.md'), `---\nname: ${slug}\ndescription: ${description}\n---\n\n# ${slug}\n`, 'utf8')
+  }
+  // .codex/agents/*.md 这类角色/规范文件也要能扫到
+  await mkdir(join(projectDir, '.codex', 'agents'), { recursive: true })
+  await writeFile(join(projectDir, '.codex', 'agents', 'java-developer.md'), '---\nname: java-developer\ndescription: Java 开发角色\n---\n\n角色说明\n', 'utf8')
+})()
+
+const conventionsScanned = await call('GET', '/skills')
+const projectItems = (conventionsScanned.json?.items ?? []).filter((item) => item.scope === 'project')
+const projectConventions = new Set(projectItems.map((item) => item.convention))
+check(
+  '项目的 .claude / .agents / .codex / .cursor / skills 五种目录都扫到',
+  ['.claude', '.agents', '.codex', '.cursor', 'skills'].every((convention) => projectConventions.has(convention)),
+  [...projectConventions],
+)
+check(
+  '每个技能都带范围 + 目录约定标签',
+  projectItems.every((item) => item.scope === 'project' && typeof item.convention === 'string'),
+  projectItems.slice(0, 3).map((item) => `${item.scope}/${item.convention}/${item.name}`),
+)
+check(
+  '角色/规范文件按 kind=agent 扫到',
+  (conventionsScanned.json?.items ?? []).some((item) => item.kind === 'agent' && item.name === 'java-developer'),
+  (conventionsScanned.json?.items ?? []).filter((item) => item.kind === 'agent').map((item) => item.name),
+)
+const summary = conventionsScanned.json?.summary ?? []
+check(
+  '来源汇总按范围分组（harness / global / project / custom）',
+  ['harness', 'global', 'project', 'custom'].every((scope) => summary.some((entry) => entry.scope === scope)),
+  summary,
+)
+check(
+  '项目范围统计到技能数',
+  (summary.find((entry) => entry.scope === 'project')?.skills ?? 0) >= 5,
+  summary.find((entry) => entry.scope === 'project'),
+)
+check(
+  'roots 带 exists 标记（不存在的目录也列出来但不扫）',
+  Array.isArray(conventionsScanned.json?.roots) && conventionsScanned.json.roots.some((r) => r.exists === false) && conventionsScanned.json.roots.some((r) => r.exists === true),
+  (conventionsScanned.json?.roots ?? []).map((r) => `${r.label}:${r.exists ? '有' : '无'}`).slice(0, 4),
+)
+
+/* 新建技能：默认写进 DeepSeek Harness 通用技能根（测试用临时 DSH_HOME，不碰真机） */
+
+const fakeDshHome = await mkdtemp(join(tmpdir(), 'rdw-dshhome-'))
+const savedDshHome = process.env.DSH_HOME
+process.env.DSH_HOME = fakeDshHome
+try {
+  const listedHarness = await call('GET', '/skills')
+  check('列出 DeepSeek Harness 技能根', listedHarness.json?.harnessSkillDir === join(fakeDshHome, 'skills'), listedHarness.json?.harnessSkillDir)
+
+  const created = await call('POST', '/skills/create', {
+    name: 'Java Code Review',
+    description: '评审 Java 代码改动：先看 diff，再看测试',
+    whenToUse: '需要评审 Java 改动时',
+    steps: '先看 diff\n再看测试\n最后给结论',
+    notes: '别改业务语义',
+  })
+  check('新建技能：写进 Harness 通用技能根', created.status === 200 && created.json?.ok === true && created.json.path === join(fakeDshHome, 'skills', 'java-code-review', 'SKILL.md'), created.json)
+  const createdText = await (await import('node:fs/promises')).readFile(created.json.path, 'utf8').catch(() => '')
+  check(
+    '生成的 SKILL.md 带 frontmatter 与步骤',
+    createdText.startsWith('---\nname: java-code-review\ndescription: 评审 Java 代码改动：先看 diff，再看测试\n---') &&
+      createdText.includes('## 怎么做') &&
+      createdText.includes('1. 先看 diff') &&
+      createdText.includes('- 别改业务语义'),
+    createdText.split('\n').slice(0, 4),
+  )
+  const afterCreate = await call('GET', '/skills')
+  check(
+    '新建后立刻能在列表里筛到（harness 范围）',
+    (afterCreate.json?.items ?? []).some((item) => item.scope === 'harness' && item.name === 'java-code-review'),
+    (afterCreate.json?.items ?? []).filter((item) => item.scope === 'harness').map((item) => item.name),
+  )
+  const again = await call('POST', '/skills/create', { name: 'java-code-review', description: '重复创建' })
+  check('重名技能被拦住并提示', again.status === 400 && String(again.json?.error ?? '').includes('已存在'), again.json)
+  const overwritten = await call('POST', '/skills/create', { name: 'java-code-review', description: '覆盖后的描述', overwrite: true })
+  check('确认覆盖后可以重建', overwritten.status === 200 && overwritten.json?.overwrote === true, overwritten.json)
+  const badName = await call('POST', '/skills/create', { name: '../../etc/passwd', description: '越权尝试' })
+  check('技能名会去掉路径字符（防穿越）', badName.status === 200 && badName.json?.path === join(fakeDshHome, 'skills', 'etcpasswd', 'SKILL.md'), badName.json)
+  const noDesc = await call('POST', '/skills/create', { name: 'no-desc' })
+  check('缺描述不给建', noDesc.status === 400 && String(noDesc.json?.error ?? '').includes('描述'), noDesc.json)
+} finally {
+  if (savedDshHome === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = savedDshHome
+}
+
+/* 也可以只建到当前项目（写进 <项目>/.claude/skills） */
+
+const projectScoped = await call('POST', '/skills/create', { name: 'project-only-skill', description: '只给这个项目用', scope: 'project' })
+check(
+  '新建技能可选只放当前项目（.claude/skills）',
+  projectScoped.status === 200 && projectScoped.json?.path === join(projectDir, '.claude', 'skills', 'project-only-skill', 'SKILL.md'),
+  projectScoped.json,
+)
+
+/* 纯函数：技能名归一化 + SKILL.md 渲染 */
+check(
+  '技能名归一化成 kebab-case',
+  slugifySkillName('  Java Code Review_v2!! ') === 'java-code-review-v2' && slugifySkillName('../../etc/passwd') === 'etcpasswd' && slugifySkillName('') === '',
+  [slugifySkillName('  Java Code Review_v2!! '), slugifySkillName('../../etc/passwd')],
+)
+check(
+  'SKILL.md 渲染带 frontmatter / 步骤 / 注意，且空值有兜底',
+  (() => {
+    const filled = renderSkillMarkdown({ name: 'a-b', description: '做一件事', steps: ['第一步', '', '第二步'], notes: ['注意点'] })
+    const empty = renderSkillMarkdown({ name: 'a-b', description: '做一件事' })
+    return filled.includes('name: a-b') && filled.includes('1. 第一步') && filled.includes('2. 第二步') && filled.includes('- 注意点') && empty.includes('1. （写下这个技能的固定步骤）')
+  })(),
+)
 
 /* ------------------------------------------- 真实需求源（端到端） */
 
@@ -630,7 +754,135 @@ check(
   [pure.clampRailWidth?.(0), pure.clampRailWidth?.(50), pure.clampRailWidth?.(9999), pure.clampRailWidth?.(200.6)],
 )
 
-/* ------------------------------------------------------- 纯函数（页面逻辑） */
+/* ------------------------------------------------ 技能与规范：来源筛选 + 新建技能 */
+
+console.log('\n[6d] 技能与规范：按来源/目录筛选 + 新建 Harness 通用技能 + 项目开发模块')
+
+const sampleSkillsData = {
+  roots: [
+    { scope: 'harness', convention: '', label: 'DeepSeek Harness · 通用技能', path: 'C:\\h\\skills', exists: true },
+    { scope: 'global', convention: '.claude', label: '全局 skill · .claude', path: 'C:\\u\\.claude\\skills', exists: true },
+    { scope: 'global', convention: '.codex', label: '全局 skill · .codex', path: 'C:\\u\\.codex\\skills', exists: true },
+    { scope: 'project', convention: '.claude', label: '项目 skill · .claude', path: 'D:\\p\\.claude\\skills', exists: true },
+    { scope: 'project', convention: '.codex', label: '项目 skill · .codex', path: 'D:\\p\\.codex\\skills', exists: false },
+  ],
+  items: [
+    { kind: 'skill', scope: 'harness', convention: '', group: 'DeepSeek Harness · 通用技能', id: 'h1', name: 'java-code-review', dirName: 'java-code-review', description: '评审 Java 改动', path: 'C:\\h\\skills\\java-code-review\\SKILL.md' },
+    { kind: 'skill', scope: 'global', convention: '.claude', group: '全局 skill · .claude', id: 'g1', name: 'coding-standards', dirName: 'coding-standards', description: '编码规范', path: 'C:\\u\\.claude\\skills\\coding-standards\\SKILL.md' },
+    { kind: 'skill', scope: 'project', convention: '.claude', group: '项目 skill · .claude', id: 'p1', name: 'feature-dev', dirName: 'feature-dev', description: '需求开发流程', path: 'D:\\p\\.claude\\skills\\feature-dev\\SKILL.md' },
+    { kind: 'agent', scope: 'project', convention: '.codex', group: '项目 skill · .codex · 角色/规范', id: 'p2', name: 'java-developer', dirName: 'java-developer', description: 'Java 开发角色', path: 'D:\\p\\.codex\\agents\\java-developer.md' },
+  ],
+  docs: [{ id: 'doc:03-coding', name: '03-coding', path: 'D:\\p\\doc\\standards\\03-coding.md' }],
+  projectDir: 'D:\\workspace\\dahua-skill\\dahua-skill-service',
+  harnessSkillDir: 'C:\\Users\\EDY\\AppData\\Roaming\\dsh-desktop\\harness\\skills',
+  summary: [
+    { scope: 'harness', roots: 1, exists: 1, skills: 1, agents: 0 },
+    { scope: 'global', roots: 7, exists: 4, skills: 41, agents: 2 },
+    { scope: 'project', roots: 7, exists: 2, skills: 1, agents: 1 },
+    { scope: 'custom', roots: 0, exists: 0, skills: 0, agents: 0 },
+  ],
+}
+const skillsProps = { state: frameState[1], reloadState: () => {}, uiWorkspace: {} }
+const skillsNode = withInjectedState({ 0: sampleSkillsData }, () => renderComponent('SkillsModule', skillsProps, 'SkillsModule（技能与规范）'))
+const skillsText = collectText(skillsNode).join(' ')
+check(
+  '技能与规范：来源按 DeepSeek Harness / 全局 / 项目 / 自定义分档',
+  ['DeepSeek Harness（1）', '全局（43）', '项目（2）', '自定义（0）'].every((label) => skillsText.includes(label)),
+  skillsText.slice(0, 200),
+)
+check(
+  '技能与规范：目录约定可筛选（.claude/.codex/…）',
+  (() => {
+    const select = collectByType(skillsNode, 'select').find((node) => node.props?.['aria-label'] === '按目录约定筛选')
+    const values = (select?.children ?? []).map((child) => child.props?.value)
+    return values.includes('.claude') && values.includes('.codex') && values.includes('all')
+  })(),
+)
+check(
+  '技能与规范：列出每个来源目录是否命中（✓/×）',
+  skillsText.includes('✓ DeepSeek Harness · 通用技能') && skillsText.includes('× 项目 skill · .codex'),
+  skillsText.slice(0, 160),
+)
+
+/* 真筛：把筛选状态注进去，看列表是不是真的只剩那一档 */
+const skillsByScope = withInjectedState({ 0: sampleSkillsData, 5: 'project' }, () => renderComponent('SkillsModule', skillsProps, 'SkillsModule（只看项目）'))
+const skillsScopeText = collectText(skillsByScope).join(' ')
+check(
+  '筛「项目」只剩项目技能（Harness/全局的不出现）',
+  skillsScopeText.includes('feature-dev') && !skillsScopeText.includes('java-code-review') && !skillsScopeText.includes('coding-standards'),
+  skillsScopeText.slice(0, 160),
+)
+const skillsByConv = withInjectedState({ 0: sampleSkillsData, 6: '.codex' }, () => renderComponent('SkillsModule', skillsProps, 'SkillsModule（只看 .codex）'))
+const skillsConvText = collectText(skillsByConv).join(' ')
+check('筛目录约定 .codex 只剩 .codex 下的条目', skillsConvText.includes('java-developer') && !skillsConvText.includes('feature-dev'), skillsConvText.slice(0, 160))
+const skillsByKind = withInjectedState({ 0: sampleSkillsData, 7: 'agent' }, () => renderComponent('SkillsModule', skillsProps, 'SkillsModule（只看角色）'))
+const skillsKindText = collectText(skillsByKind).join(' ')
+check('筛「只看角色/规范」只剩 agent 条目', skillsKindText.includes('java-developer') && !skillsKindText.includes('feature-dev'), skillsKindText.slice(0, 160))
+const skillsByQuery = withInjectedState({ 0: sampleSkillsData, 8: '编码' }, () => renderComponent('SkillsModule', skillsProps, 'SkillsModule（搜关键词）'))
+check('关键词搜索命中描述', collectText(skillsByQuery).join(' ').includes('coding-standards') && !collectText(skillsByQuery).join(' ').includes('feature-dev'))
+
+const skillsCreating = withInjectedState({ 0: sampleSkillsData, 9: true }, () => renderComponent('SkillsModule', skillsProps, 'SkillsModule（新建技能）'))
+const creatingText = collectText(skillsCreating).join(' ')
+check(
+  '新建技能表单默认写 DeepSeek Harness 通用目录',
+  creatingText.includes('新建技能') && creatingText.includes('写入 DeepSeek Harness 通用技能目录') && creatingText.includes('C:\\Users\\EDY\\AppData\\Roaming\\dsh-desktop\\harness\\skills'),
+  creatingText.slice(0, 220),
+)
+const creatingInputs = collectByType(skillsCreating, 'input').map((node) => node.props?.['aria-label'])
+check(
+  '新建技能表单有名称/描述/步骤/注意事项字段',
+  ['技能名称', '技能描述'].every((label) => creatingInputs.includes(label)) && collectByType(skillsCreating, 'textarea').length >= 3,
+  creatingInputs,
+)
+const skillsCreatingProject = withInjectedState(
+  { 0: sampleSkillsData, 9: true, 10: { name: 'x', description: 'y', whenToUse: '', steps: '', notes: '', scope: 'project' } },
+  () => renderComponent('SkillsModule', skillsProps, 'SkillsModule（新建·项目范围）'),
+)
+check('新建技能可以改成只放当前项目', collectText(skillsCreatingProject).join(' ').includes('写入当前项目的 .claude/skills'))
+
+/* ------------------------------------------------------ 项目开发模块（AI 进度） */
+
+const taskTable = { key: 'task:dahua-skill-service', label: '开发任务 · dahua-skill-service', tableName: '开发任务表', kind: 'task', configPath: 'D:\\p\\.dev-task-sources.json', fieldMap: null }
+const devRuns = [
+  { id: 'r1', at: '2026-10-22T10:00:00.000Z', title: '实现技能导入', status: 'done', recordId: 't1', tableKey: taskTable.key },
+  { id: 'r2', at: '2026-10-22T11:00:00.000Z', title: '导出优化', status: 'in-progress', recordId: 't2', tableKey: taskTable.key },
+  { id: 'r3', at: '2026-10-22T12:00:00.000Z', title: '导出优化', status: 'blocked', recordId: 't2', tableKey: taskTable.key },
+]
+const devData = {
+  configured: true,
+  table: { key: taskTable.key, fieldMap: { status: '状态' } },
+  items: [
+    { id: 't1', title: '实现技能导入', code: 'T-1', status: '已完成', owner: '陈辉', fields: { 状态: '已完成', 任务标题: '实现技能导入' } },
+    { id: 't2', title: '导出优化', code: 'T-2', status: '开发中', owner: '陈辉', fields: { 状态: '开发中', 任务标题: '导出优化' } },
+    { id: 't3', title: '待排期任务', code: 'T-3', status: '待开发', fields: { 状态: '待开发', 任务标题: '待排期任务' } },
+  ],
+}
+const devProps = { state: frameState[1], tables: [sampleTable, taskTable], runs: devRuns, reloadRuns: () => {}, onOpenTable: () => {} }
+const devNode = withInjectedState({ 0: devData }, () => renderComponent('DevModule', devProps, 'DevModule（项目开发）'))
+const devText = collectText(devNode).join(' ')
+check('项目开发模块：任务清单列出每条任务与状态', devText.includes('实现技能导入') && devText.includes('导出优化') && devText.includes('待排期任务') && devText.includes('开发中'), devText.slice(0, 200))
+check('项目开发模块：按状态统计任务进度', devText.includes('已完成 1') && devText.includes('开发中 1') && devText.includes('待开发 1') && devText.includes('整体完成度'), devText.slice(0, 200))
+check(
+  '项目开发模块：合并工作台的 AI 执行记录（已完成/进行中/受阻/未开始）',
+  devText.includes('AI 开发进度') && devText.includes('已完成 1') && devText.includes('进行中 1') && devText.includes('受阻') && devText.includes('还没交给 AI 1'),
+  devText.slice(0, 240),
+)
+check('项目开发模块：有进度条与刷新入口', collectByType(devNode, 'i').some((node) => String(node.props?.style?.width ?? '').includes('%')) && devText.includes('刷新') && devText.includes('在任务表里看'))
+const devNoTable = withInjectedState({ 0: devData }, () => renderComponent('DevModule', { ...devProps, tables: [sampleTable] }, 'DevModule（没有任务表）'))
+check('项目开发模块：没认到任务表时给提示而不是空白', collectText(devNoTable).join(' ').includes('还没认到开发任务表'))
+const devEmpty = withInjectedState({ 0: { configured: true, table: { fieldMap: { status: '状态' } }, items: [] } }, () => renderComponent('DevModule', devProps, 'DevModule（空任务表）'))
+check('项目开发模块：任务表为空时提示怎么开始', collectText(devEmpty).join(' ').includes('开发任务表里还没有记录'))
+const devEmptyText = collectText(devEmpty).join(' ')
+check(
+  '项目开发模块：任务表为空也列出 AI 执行记录（看得见进度）',
+  devEmptyText.includes('最近 AI 执行记录（3）') && devEmptyText.includes('实现技能导入') && devEmptyText.includes('已交付') && devEmptyText.includes('进行中'),
+  devEmptyText.slice(0, 240),
+)
+const devNoRuns = withInjectedState({ 0: { configured: true, table: { fieldMap: { status: '状态' } }, items: [] } }, () => renderComponent('DevModule', { ...devProps, runs: [] }, 'DevModule（没执行记录）'))
+check('项目开发模块：完全没有执行记录时给引导语', collectText(devNoRuns).join(' ').includes('还没有执行记录'))
+check('左侧导航有「项目开发」入口（内置模块）', collectText(railFrame).join(' ').includes('项目开发') && clientSource.includes("{ kind: 'dev', id: 'dev', glyph: '🛠', label: '项目开发' }"))
+
+
 
 console.log('\n[6c] 页面纯函数：配置切片 / 模块 / 进度口径')
 const mergedSlice = pure.sliceForTable?.(
