@@ -835,6 +835,32 @@ const chatWrapClosed = collectByType(frameClosed, 'div').find((node) => node.pro
 check('「展开对话」把宿主原生对话挂到右侧', collectText(frameOpen).join(' ').includes('收起对话') && chatWrapOpen?.props?.style?.display === 'flex' && collectText(chatWrapOpen).join(' ').includes('原生对话占位'), chatWrapOpen?.props?.style)
 check('「收起对话」时对话区隐藏', chatWrapClosed?.props?.style?.display === 'none' && collectText(frameOpen).join(' ').includes('收起工作台'))
 
+const frameExperts = withInjectedState(
+  { ...frameState, 8: 'experts', 11: { experts: [], teams: [] } },
+  () => renderComponent('BusinessPanel', frameProps, 'BusinessPanel（切到专家与专家团）'),
+)
+/* 左导航切到「专家与专家团」：内容区真的换成专家库 */
+// 桩 React 不会展开嵌套的函数组件，所以这里断言「内容区挂的是哪个模块组件」
+const mainModuleOf = (states) => {
+  const node = withInjectedState(states, () => components.BusinessPanel(frameProps))
+  const main = collectByType(node, 'div').find((entry) => String(entry.props?.className ?? '') === 'rdw-main')
+  const first = (main?.children ?? [])[0]
+  return typeof first?.type === 'function' ? first.type.name : null
+}
+const railWiring = {
+  overview: mainModuleOf({ ...frameState }),
+  dev: mainModuleOf({ ...frameState, 8: 'dev' }),
+  experts: mainModuleOf({ ...frameState, 8: 'experts' }),
+  skills: mainModuleOf({ ...frameState, 8: 'skills' }),
+}
+check(
+  '左导航四个入口各就各位（总览 / 项目开发 / 专家与专家团 / 技能与规范）',
+  railWiring.overview === 'OverviewModule' && railWiring.dev === 'DevModule' && railWiring.experts === 'ExpertsModule' && railWiring.skills === 'SkillsModule',
+  railWiring,
+)
+const frameExpertsText = collectText(frameExperts).join(' ')
+check('左导航里同时有总览 / 项目开发 / 专家与专家团 / 技能与规范', ['总览', '项目开发', '专家与专家团', '技能与规范'].every((label) => frameExpertsText.includes(label)))
+
 /* 侧边栏：可拖拽调宽 + 改模块名字 */
 
 const probeFrame = (states) => withInjectedState(states, () => components.BusinessPanel(frameProps))
