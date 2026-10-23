@@ -150,6 +150,7 @@ const DEFAULT_SETTINGS = {
   ownerField: '',
   projectDir: '',
   skillsRoots: [],
+  expert: '',
   updatedAt: '',
 }
 
@@ -1145,7 +1146,40 @@ function parseFrontmatter(text) {
   return out
 }
 
-/** 技能目录：技能本体 + 同名目录下的角色/规范文件（.claude/agents/*.md 这类）。 */
+/** 角色/专家定义：<目录>/agents/<id>.md（WorkBuddy 的专家也是这一种文件）。 */
+async function collectExpertsInRoot(root, items) {
+  const agentsDir = join(dirname(root.path), 'agents')
+  const agentEntries = await readdir(agentsDir, { withFileTypes: true }).catch(() => [])
+  for (const entry of agentEntries) {
+    if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.md')) continue
+    const file = join(agentsDir, entry.name)
+    const text = await readFile(file, 'utf8').catch(() => null)
+    if (text === null) continue
+    const front = parseFrontmatter(text)
+    const id = entry.name.replace(/\.md$/i, '')
+    items.push({
+      kind: 'agent',
+      scope: root.scope,
+      convention: root.convention,
+      rootPath: agentsDir,
+      group: `${root.label} · 角色/规范`,
+      id: `agent:${id}`,
+      agentId: id,
+      name: front.name || id,
+      dirName: id,
+      displayName: front.displayName || '',
+      profession: front.profession || '',
+      description: front.description || '',
+      maxTurns: front.maxTurns ? Number(front.maxTurns) || 0 : 0,
+      tags: front.tags ? String(front.tags).split(/[,，]/).map((tag) => tag.trim()).filter(Boolean) : [],
+      path: file,
+      chars: text.length,
+    })
+  }
+  return agentsDir
+}
+
+/** 技能目录：技能本体 + 同名目录下的角色/专家文件（.claude/agents/*.md 这类）。 */
 async function collectSkillsInRoot(root, items) {
   const entries = await readdir(root.path, { withFileTypes: true }).catch(() => [])
   for (const entry of entries) {
@@ -1168,28 +1202,7 @@ async function collectSkillsInRoot(root, items) {
       chars: text.length,
     })
   }
-  const agentsDir = join(dirname(root.path), 'agents')
-  const agentEntries = await readdir(agentsDir, { withFileTypes: true }).catch(() => [])
-  for (const entry of agentEntries) {
-    if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.md')) continue
-    const file = join(agentsDir, entry.name)
-    const text = await readFile(file, 'utf8').catch(() => null)
-    if (text === null) continue
-    const front = parseFrontmatter(text)
-    items.push({
-      kind: 'agent',
-      scope: root.scope,
-      convention: root.convention,
-      rootPath: agentsDir,
-      group: `${root.label} · 角色/规范`,
-      id: `agent:${file}`,
-      name: front.name || entry.name.replace(/\.md$/i, ''),
-      dirName: entry.name.replace(/\.md$/i, ''),
-      description: front.description || '',
-      path: file,
-      chars: text.length,
-    })
-  }
+  await collectExpertsInRoot(root, items)
 }
 
 /** DeepSeek Harness 通用技能根（跨项目可用）；没有就返回空。 */
@@ -1382,6 +1395,183 @@ async function readSkillFile(config, settings, target) {
   const text = await readFile(hit, 'utf8').catch(() => null)
   if (text === null) return { ok: false, error: '文件读不到' }
   return { ok: true, path: hit, text }
+}
+
+/* -------------------------------------------- 专家 / 专家团（参考 WorkBuddy） */
+
+/** 专家文件放哪：通用 = DSH_HOME/agents；项目 = <项目>/<约定>/agents（默认 .claude）。 */
+function expertDirFor(scope, convention, settings) {
+  if (scope === 'project') {
+    const projectDir = String(settings.projectDir ?? '').trim()
+    if (!projectDir) return ''
+    const safe = SKILL_CONVENTIONS.some((entry) => entry.dir && entry.dir === convention) ? convention : '.claude'
+    return join(projectDir, safe, 'agents')
+  }
+  return process.env.DSH_HOME ? join(process.env.DSH_HOME, 'agents') : ''
+}
+
+function expertTargets(config, settings) {
+  return {
+    harness: { dir: expertDirFor('harness', '', settings), label: 'DeepSeek Harness 通用专家（所有项目可用）' },
+    project: { dir: expertDirFor('project', '.claude', settings), label: '当前项目专家（写进 <.claude>/agents）' },
+  }
+}
+
+/** 专家团清单文件：通用放 DSH_HOME/experts，项目放 <项目>/.dsh/experts。 */
+function teamFiles(config, settings) {
+  const projectDir = String(settings.projectDir ?? '').trim()
+  const list = []
+  if (process.env.DSH_HOME) list.push({ scope: 'harness', path: join(process.env.DSH_HOME, 'experts', 'teams.json'), label: 'DeepSeek Harness 通用专家团' })
+  if (projectDir) list.push({ scope: 'project', path: join(projectDir, '.dsh', 'experts', 'teams.json'), label: '当前项目专家团' })
+  return list
+}
+
+async function readTeamFile(file) {
+  const raw = await readFile(file.path, 'utf8').catch(() => null)
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    const teams = Array.isArray(parsed?.teams) ? parsed.teams : []
+    return teams
+      .filter((team) => team && typeof team.id === 'string' && team.id)
+      .map((team) => ({
+        kind: 'team',
+        scope: file.scope,
+        path: file.path,
+        id: String(team.id),
+        name: String(team.name || team.id),
+        profession: String(team.profession || ''),
+        description: String(team.description || ''),
+        lead: String(team.lead || ''),
+        members: Array.isArray(team.members) ? team.members.map(String) : [],
+        flow: Array.isArray(team.flow) ? team.flow.map(String) : [],
+        createdAt: String(team.createdAt || ''),
+      }))
+  } catch {
+    return []
+  }
+}
+
+/** 专家作用域优先级：同名时以「当前项目」的为准（最贴近这个仓库的上下文）。 */
+const EXPERT_SCOPE_ORDER = { project: 0, harness: 1, global: 2, custom: 3 }
+
+async function listExperts(config, settings) {
+  const roots = skillRootsFor(config, settings)
+  const found = []
+  const agentDirs = []
+  for (const root of roots) {
+    // 技能目录可能还没建，但同级的 agents 目录里可能已经有专家：所以这里不看 root.exists
+    const dir = await collectExpertsInRoot(root, found)
+    if (dir) agentDirs.push({ scope: root.scope, convention: root.convention, label: root.label, path: dir, exists: existsSync(dir) })
+  }
+  // 同一个专家名字常在 .claude/agents 和 .agents/agents 各放一份：只留一份，其余位置记进 alsoIn
+  const byId = new Map()
+  const experts = []
+  for (const expert of [...found].sort((a, b) => (EXPERT_SCOPE_ORDER[a.scope] ?? 9) - (EXPERT_SCOPE_ORDER[b.scope] ?? 9))) {
+    const hit = byId.get(expert.agentId)
+    if (hit) {
+      hit.alsoIn = [...(hit.alsoIn ?? []), expert.path]
+      continue
+    }
+    const copy = { ...expert }
+    byId.set(expert.agentId, copy)
+    experts.push(copy)
+  }
+  const teams = []
+  for (const file of teamFiles(config, settings)) teams.push(...(await readTeamFile(file)))
+  const summary = { harness: 0, global: 0, project: 0, custom: 0 }
+  for (const expert of experts) if (expert.scope in summary) summary[expert.scope] += 1
+  return { experts, teams, agentDirs, summary, duplicates: found.length - experts.length, selected: String(settings.expert ?? ''), targets: expertTargets(config, settings), projectDir: settings.projectDir }
+}
+
+/** 生成一份专家角色定义（frontmatter 用扁平键，正文参考 WorkBuddy 的四段式）。 */
+export function renderExpertMarkdown({ id, name, displayName = '', profession = '', description, maxTurns = 0, abilities = [], flow = [], outputs = [], cautions = [] }) {
+  const lines = ['---', `name: ${id}`, `description: ${String(description).replace(/\s+/g, ' ').trim()}`, `displayName: ${displayName || name || id}`, `profession: ${profession || name || id}`]
+  if (Number(maxTurns) > 0) lines.push(`maxTurns: ${Number(maxTurns)}`)
+  lines.push('---', '', `# ${displayName || name || id} · ${profession || name || id}`, '')
+  lines.push(String(description).trim(), '')
+  const section = (title, items, fallback) => {
+    lines.push(`## ${title}`, '')
+    const list = (items ?? []).map((line) => String(line).trim()).filter(Boolean)
+    if (list.length) for (const [index, line] of list.entries()) lines.push(`${index + 1}. ${line}`)
+    else lines.push(fallback)
+    lines.push('')
+  }
+  section('核心能力', abilities, '1. （写下这个专家最擅长的几件事）')
+  section('工作流程', flow, '1. （写下他接到需求后的固定步骤）')
+  section('输出规范', outputs, '1. （写下他交付时要给什么：结构、字段、示例）')
+  section('注意事项', cautions, '1. （写下他的红线与不越界的地方）')
+  return `${lines.join('\n')}`
+}
+
+async function createExpert(config, settings, body) {
+  const id = slugifySkillName(body?.id || body?.name)
+  if (!id) return { ok: false, error: '专家标识请用小写字母、数字和连字符（例如 java-backend-expert）' }
+  const description = String(body?.description ?? '').trim()
+  if (!description) return { ok: false, error: '请写一句这个专家是干什么的（AI 靠它判断什么时候请他）' }
+  const scope = body?.scope === 'project' ? 'project' : 'harness'
+  const dir = expertDirFor(scope, String(body?.convention || '.claude'), settings)
+  if (!dir) return { ok: false, error: scope === 'project' ? '还没选项目目录，选一个再创建项目专家' : '取不到 DSH_HOME，定位不到通用专家目录' }
+  const convention = scope === 'project' ? String(body?.convention || '.claude') : ''
+  const file = join(dir, `${id}.md`)
+  if (existsSync(file) && !body?.overwrite) return { ok: false, error: `专家「${id}」已存在，换个标识或先删掉它`, path: file, exists: true }
+  const text = renderExpertMarkdown({
+    id,
+    name: String(body?.name ?? '').trim(),
+    displayName: String(body?.displayName ?? '').trim(),
+    profession: String(body?.profession ?? '').trim(),
+    description,
+    maxTurns: Number(body?.maxTurns ?? 0) || 0,
+    abilities: String(body?.abilities ?? '').split('\n'),
+    flow: String(body?.flow ?? '').split('\n'),
+    outputs: String(body?.outputs ?? '').split('\n'),
+    cautions: String(body?.cautions ?? '').split('\n'),
+  })
+  try {
+    await mkdir(dir, { recursive: true })
+    await writeFile(file, text, 'utf8')
+  } catch (error) {
+    return { ok: false, error: `写专家文件失败：${String(error?.message ?? error)}`, path: file }
+  }
+  return { ok: true, kind: 'expert', id, scope, convention, path: file, chars: text.length, overwrote: Boolean(body?.overwrite) }
+}
+
+async function createTeam(config, settings, body) {
+  const id = slugifySkillName(body?.id || body?.name)
+  if (!id) return { ok: false, error: '专家团标识请用小写字母、数字和连字符（例如 hr-delivery-team）' }
+  const name = String(body?.name ?? '').trim() || id
+  const scope = body?.scope === 'project' ? 'project' : 'harness'
+  const file = teamFiles(config, settings).find((entry) => entry.scope === scope)
+  if (!file) return { ok: false, error: scope === 'project' ? '还没选项目目录，选一个再建项目专家团' : '取不到 DSH_HOME，定位不到通用专家团目录' }
+  const listing = await listExperts(config, settings)
+  const known = new Map(listing.experts.map((expert) => [expert.agentId, expert]))
+  const members = [...new Set((Array.isArray(body?.members) ? body.members : []).map((value) => slugifySkillName(value)).filter(Boolean))]
+  const missing = members.filter((member) => !known.has(member))
+  if (missing.length) return { ok: false, error: `这些专家还没找到：${missing.join('、')}（先创建专家，或从列表里选）` }
+  if (!members.length) return { ok: false, error: '专家团至少要有 1 名专家' }
+  const lead = slugifySkillName(body?.lead) || members[0]
+  if (!members.includes(lead)) members.unshift(lead)
+  const existing = await readTeamFile(file)
+  const team = {
+    id,
+    name,
+    profession: String(body?.profession ?? '').trim(),
+    description: String(body?.description ?? '').trim(),
+    lead,
+    members,
+    flow: String(body?.flow ?? '').split('\n').map((line) => line.trim()).filter(Boolean),
+    createdAt: new Date().toISOString(),
+  }
+  const kept = existing.filter((entry) => entry.id !== id)
+  if (existing.some((entry) => entry.id === id) && !body?.overwrite) return { ok: false, error: `专家团「${id}」已存在，勾上覆盖再建`, path: file.path, exists: true }
+  const payload = { version: 1, updatedAt: new Date().toISOString(), teams: [...kept.map(({ kind, scope: _s, path: _p, ...rest }) => rest), team] }
+  try {
+    await mkdir(dirname(file.path), { recursive: true })
+    await writeFile(file.path, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+  } catch (error) {
+    return { ok: false, error: `写专家团失败：${String(error?.message ?? error)}`, path: file.path }
+  }
+  return { ok: true, kind: 'team', id, scope, path: file.path, members, lead, overwrote: Boolean(body?.overwrite) }
 }
 
 /* -------------------------------------------------------------- HTTP 层 */
@@ -1621,6 +1811,25 @@ export function apply(ctx, config) {
         const settings = await readSettings(config)
         const body = await readBody(req)
         const result = await createSkill(config, settings, body)
+        return sendJson(res, result.ok ? 200 : 400, result)
+      }
+
+      if (route === '/experts' && req.method === 'GET') {
+        const settings = await readSettings(config)
+        return sendJson(res, 200, await listExperts(config, settings))
+      }
+
+      if (route === '/expert/create' && req.method === 'POST') {
+        const settings = await readSettings(config)
+        const body = await readBody(req)
+        const result = await createExpert(config, settings, body)
+        return sendJson(res, result.ok ? 200 : 400, result)
+      }
+
+      if (route === '/team/create' && req.method === 'POST') {
+        const settings = await readSettings(config)
+        const body = await readBody(req)
+        const result = await createTeam(config, settings, body)
         return sendJson(res, result.ok ? 200 : 400, result)
       }
 

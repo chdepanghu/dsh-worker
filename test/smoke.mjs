@@ -9,10 +9,10 @@
  * 运行：node test/smoke.mjs
  */
 import { EventEmitter } from 'node:events'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, alignMatrixColumns, buildBatchUpdatePayload, cellValueFor, matrixShape, normalizeRecord, parseBaseInput, parseLarkRecords, recordsFromMatrix, renderSkillMarkdown, slugifySkillName } from '../dsh/index.js'
+import { apply, alignMatrixColumns, buildBatchUpdatePayload, cellValueFor, matrixShape, normalizeRecord, parseBaseInput, parseLarkRecords, recordsFromMatrix, renderExpertMarkdown, renderSkillMarkdown, slugifySkillName } from '../dsh/index.js'
 
 const LARK = process.env.RDW_LARK_CLI || 'D:\\soft\\nodejs\\lark-cli.ps1'
 const BASE_TOKEN = process.env.RDW_TEST_BASE || 'I3YnbPQp6awaxWsC1FZc8v89nyc'
@@ -358,6 +358,117 @@ check(
   projectScoped.json,
 )
 
+/* ---------------- 专家 / 专家团（参考 WorkBuddy：角色文件 = agents/<id>.md） ---------------- */
+
+const expertHome = await mkdtemp(join(tmpdir(), 'rdw-expert-'))
+const savedHomeForExperts = process.env.DSH_HOME
+process.env.DSH_HOME = expertHome
+try {
+  const made = await call('POST', '/expert/create', {
+    id: 'Java Backend Expert',
+    displayName: '老陈',
+    profession: 'Java 后端开发专家',
+    description: '负责后端需求理解、接口与表结构设计、代码实现与单测',
+    maxTurns: 30,
+    abilities: '看懂 Spring Boot 分层架构\n设计 REST 接口与表结构',
+    flow: '先读 AGENTS.md\n再分析影响范围\n最后实现并自测',
+    outputs: '接口契约 + 表结构 + 改动清单',
+    cautions: '不改业务语义\n不动没要求的文件',
+  })
+  check(
+    '新建专家：写进 Harness 通用专家目录 <DSH_HOME>/agents/<id>.md',
+    made.status === 200 && made.json?.path === join(expertHome, 'agents', 'java-backend-expert.md'),
+    made.json,
+  )
+  const expertText = await (await import('node:fs/promises')).readFile(made.json.path, 'utf8').catch(() => '')
+  check(
+    '专家文件带 frontmatter（name/description/displayName/profession）与四段式正文',
+    expertText.startsWith('---\nname: java-backend-expert\ndescription: 负责后端需求理解') &&
+      expertText.includes('displayName: 老陈') &&
+      expertText.includes('profession: Java 后端开发专家') &&
+      expertText.includes('## 核心能力') &&
+      expertText.includes('## 工作流程') &&
+      expertText.includes('## 输出规范') &&
+      expertText.includes('## 注意事项') &&
+      expertText.includes('1. 看懂 Spring Boot 分层架构'),
+    expertText.split('\n').slice(0, 6),
+  )
+  const listedExperts = await call('GET', '/experts')
+  const harnessExpert = (listedExperts.json?.experts ?? []).find((entry) => entry.agentId === 'java-backend-expert')
+  check(
+    '专家库列出来并带范围/约定/定位（给对话里选人用）',
+    listedExperts.status === 200 && Boolean(harnessExpert) && harnessExpert.scope === 'harness' && harnessExpert.profession === 'Java 后端开发专家' && harnessExpert.maxTurns === 30,
+    harnessExpert,
+  )
+  check('专家库统计按范围分组', (listedExperts.json?.summary ?? {}).harness >= 1, listedExperts.json?.summary)
+  // 同一个名字在 .claude/agents 与 .agents/agents 各有一份时，只列一次，其余位置记进 alsoIn
+  await mkdir(join(projectDir, '.claude', 'agents'), { recursive: true })
+  await writeFile(join(projectDir, '.claude', 'agents', 'dup-role.md'), '---\nname: dup-role\ndescription: 项目里的角色\n---\n\n正文\n', 'utf8')
+  await mkdir(join(projectDir, '.agents', 'agents'), { recursive: true })
+  await writeFile(join(projectDir, '.agents', 'agents', 'dup-role.md'), '---\nname: dup-role\ndescription: 另一份\n---\n\n正文\n', 'utf8')
+  const deduped = await call('GET', '/experts')
+  const dupRoles = (deduped.json?.experts ?? []).filter((entry) => entry.agentId === 'dup-role')
+  check(
+    '同名专家只列一次（优先当前项目），其它位置记进「同名还在」',
+    dupRoles.length === 1 && dupRoles[0].scope === 'project' && (dupRoles[0].alsoIn ?? []).length === 1 && (deduped.json?.duplicates ?? 0) >= 1,
+    dupRoles[0],
+  )
+
+  const dupExpert = await call('POST', '/expert/create', { id: 'java-backend-expert', description: '重复' })
+  check('专家重名被拦住', dupExpert.status === 400 && String(dupExpert.json?.error ?? '').includes('已存在'), dupExpert.json)
+
+  const projectExpert = await call('POST', '/expert/create', { id: 'fe-expert', description: '前端专家', scope: 'project', convention: '.codex' })
+  check(
+    '专家可选只放当前项目（<项目>/.codex/agents）',
+    projectExpert.status === 200 && projectExpert.json?.path === join(projectDir, '.codex', 'agents', 'fe-expert.md'),
+    projectExpert.json,
+  )
+
+  const team = await call('POST', '/team/create', {
+    id: 'HR Delivery Team',
+    name: 'HR 交付专家团',
+    profession: '需求→架构→实现→评审一条龙',
+    description: '一个团长带多名专家，按阶段接力交付',
+    lead: 'java-backend-expert',
+    members: ['java-backend-expert', 'fe-expert'],
+    flow: '团长先拆需求\n后端实现\n前端跟着接口联调\n团长做验收',
+  })
+  check(
+    '新建专家团：写进 <DSH_HOME>/experts/teams.json，带团长与成员',
+    team.status === 200 && team.json?.path === join(expertHome, 'experts', 'teams.json') && team.json?.lead === 'java-backend-expert' && (team.json?.members ?? []).length === 2,
+    team.json,
+  )
+  const listedTeams = await call('GET', '/experts')
+  const savedTeam = (listedTeams.json?.teams ?? []).find((entry) => entry.id === 'hr-delivery-team')
+  check(
+    '专家团可读回（成员/团长/协作流程都在）',
+    Boolean(savedTeam) && savedTeam.members.length === 2 && savedTeam.flow.length === 4 && savedTeam.name === 'HR 交付专家团',
+    savedTeam,
+  )
+  const dupTeam = await call('POST', '/team/create', { id: 'hr-delivery-team', members: ['java-backend-expert'] })
+  check('专家团重名要确认覆盖', dupTeam.status === 400 && String(dupTeam.json?.error ?? '').includes('覆盖'), dupTeam.json)
+  const badTeam = await call('POST', '/team/create', { id: 'x-team', members: ['nobody'] })
+  check('专家团成员不存在会被拦住', badTeam.status === 400 && String(badTeam.json?.error ?? '').includes('还没找到'), badTeam.json)
+  const emptyTeam = await call('POST', '/team/create', { id: 'y-team', members: [] })
+  check('专家团至少要 1 名专家', emptyTeam.status === 400 && String(emptyTeam.json?.error ?? '').includes('至少'), emptyTeam.json)
+
+  const picked = await call('POST', '/settings', { expert: 'agent:java-backend-expert' })
+  check('选中的专家能存进设置（对话交付默认用它）', picked.status === 200 && picked.json?.settings?.expert === 'agent:java-backend-expert', picked.json?.settings?.expert)
+  const expertState = await call('GET', '/state')
+  check('选中专家读回一致', expertState.json?.settings?.expert === 'agent:java-backend-expert', expertState.json?.settings?.expert)
+} finally {
+  if (savedHomeForExperts === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = savedHomeForExperts
+}
+
+check(
+  '专家角色定义渲染：四段式 + 扁平 frontmatter',
+  (() => {
+    const text = renderExpertMarkdown({ id: 'a-b', displayName: '小王', profession: '测试专家', description: '负责测试', abilities: ['会写用例'], flow: [], outputs: [], cautions: [] })
+    return text.includes('name: a-b') && text.includes('displayName: 小王') && text.includes('## 核心能力') && text.includes('1. 会写用例') && text.includes('1. （写下他接到需求后的固定步骤）')
+  })(),
+)
+
 /* 纯函数：技能名归一化 + SKILL.md 渲染 */
 check(
   '技能名归一化成 kebab-case',
@@ -487,6 +598,12 @@ check('客户端包含卡片看板与汇总清单', clientSource.includes('卡�
 check('客户端支持拖拽（卡片 + 模块）', clientSource.includes("type: 'card'") && clientSource.includes("type: 'module'") && clientSource.includes('onDragStart'))
 check('客户端按容器宽度重排（ResizeObserver）', clientSource.includes('ResizeObserver'))
 check('客户端有总览 / 执行记录 / 添加模块 / 进度视图', clientSource.includes('工作台执行记录') && clientSource.includes('添加模块') && clientSource.includes("setMode('progress')"))
+const pkgJson = JSON.parse(await readClient(new URL('../package.json', import.meta.url), 'utf8'))
+check(
+  '版本号一致（package.json 与客户端常量）',
+  pkgJson.version === String(clientSource.match(/WORKBENCH_VERSION = '([^']+)'/)?.[1] ?? '') && /^\d+\.\d+\.\d+$/.test(pkgJson.version),
+  { pkg: pkgJson.version, client: clientSource.match(/WORKBENCH_VERSION = '([^']+)'/)?.[1] },
+)
 
 /* --------------------------- 客户端真的能加载：桩 React 直接执行组件函数体 */
 
@@ -924,6 +1041,104 @@ if (!real.json?.error && real.json?.items?.length) {
   const inOptions = withStatus.filter((item) => options.includes(item.fields['状态'])).length
   check('筛选用到的「状态」选项值与真实数据对得上', options.length > 0 && inOptions === withStatus.length, { options, inOptions, withStatus: withStatus.length, total: items.length })
 }
+
+/* --------------------------------- 专家与专家团 + 分组收缩展开（客户端） */
+
+console.log('\n[6e] 专家与专家团 + 技能分组收缩展开')
+
+const sampleExpertData = {
+  experts: [
+    { kind: 'agent', scope: 'harness', convention: '', agentId: 'java-backend-expert', name: 'java-backend-expert', displayName: '老陈', profession: 'Java 后端开发专家', description: '负责后端需求理解与实现', path: 'C:\\h\\agents\\java-backend-expert.md' },
+    { kind: 'agent', scope: 'project', convention: '.claude', agentId: 'requirement-analyst', name: 'requirement-analyst', displayName: '小析', profession: '需求分析师', description: '把模糊需求讲清楚', path: 'D:\\p\\.claude\\agents\\requirement-analyst.md' },
+  ],
+  teams: [{ kind: 'team', scope: 'harness', id: 'hr-delivery-team', name: 'HR 交付专家团', profession: '一条龙交付', description: '团长带人接力', lead: 'java-backend-expert', members: ['java-backend-expert', 'requirement-analyst'], flow: ['团长拆需求', '后端实现', '团长验收'], path: 'C:\\h\\experts\\teams.json' }],
+  summary: { harness: 1, global: 0, project: 1, custom: 0 },
+  selected: '',
+  targets: { harness: { dir: 'C:\\h\\agents', label: '通用' }, project: { dir: 'D:\\p\\.claude\\agents', label: '项目' } },
+  projectDir: 'D:\\workspace\\dahua-skill\\dahua-skill-service',
+}
+
+/* 技能来源分组：可收缩/展开 */
+const skillsGroupHead = collectByType(skillsNode, 'button').find((node) => String(node.props?.className ?? '').includes('rdw-group'))
+check(
+  '技能来源分组标题可点（带 ▾ 与条数，aria-expanded 正确）',
+  Boolean(skillsGroupHead) && skillsGroupHead.props['aria-expanded'] === 'true' && collectText(skillsGroupHead).join(' ').includes('▾'),
+  { cls: skillsGroupHead?.props?.className, text: collectText(skillsGroupHead ?? { children: [] }).join(' ') },
+)
+check('存在「全部收起/全部展开」入口', skillsText.includes('全部收起') || skillsText.includes('全部展开'))
+const collapsedNode = withInjectedState({ 0: sampleSkillsData, 12: ['项目 skill · .claude'] }, () => renderComponent('SkillsModule', skillsProps, 'SkillsModule（收起一组）'))
+const collapsedText = collectText(collapsedNode).join(' ')
+check(
+  '收起某一组后，该组条目隐藏，其它组照常显示',
+  !collapsedText.includes('feature-dev') && collapsedText.includes('java-code-review') && collapsedText.includes('coding-standards'),
+  collapsedText.slice(0, 180),
+)
+const collapsedHead = collectByType(collapsedNode, 'button')
+  .filter((node) => String(node.props?.className ?? '').includes('rdw-group'))
+  .find((node) => collectText(node).join(' ').includes('项目 skill · .claude'))
+check('收起态：分组标题变 ▸ 且 aria-expanded=false', String(collapsedHead?.props?.['aria-expanded']) === 'false' && collectText(collapsedHead ?? { children: [] }).join(' ').includes('▸'))
+
+/* 专家库 */
+const expertProps = { state: frameState[1], reloadState: () => {}, uiWorkspace: {}, expertData: sampleExpertData, reloadExperts: () => {} }
+const expertsNode = withInjectedState({ 0: sampleExpertData }, () => renderComponent('ExpertsModule', expertProps, 'ExpertsModule（专家与专家团）'))
+const expertsText = collectText(expertsNode).join(' ')
+check(
+  '专家库：按来源分组列出专家与专家团',
+  expertsText.includes('老陈 · Java 后端开发专家') && expertsText.includes('HR 交付专家团') && expertsText.includes('DeepSeek Harness 通用专家') && expertsText.includes('当前项目专家'),
+  expertsText.slice(0, 220),
+)
+check(
+  '专家库：每个专家/专家团都能一键选中（给对话用）',
+  expertsText.includes('不用专家（普通交付）') && expertsText.includes('专家 · 老陈') && expertsText.includes('专家团 · HR 交付专家团'),
+)
+const expertsPicked = withInjectedState({ 0: sampleExpertData }, () =>
+  renderComponent('ExpertsModule', { ...expertProps, state: { configured: true, settings: { projectDir: 'D:\\p', expert: 'team:hr-delivery-team' } } }, 'ExpertsModule（选中专家团）'),
+)
+check('专家库：已选中的角色会高亮显示', collectText(expertsPicked).join(' ').includes('当前交付用哪个角色'))
+const expertForm = withInjectedState({ 0: sampleExpertData, 5: 'expert' }, () => renderComponent('ExpertsModule', expertProps, 'ExpertsModule（新建专家）'))
+const expertFormInputs = collectByType(expertForm, 'input').map((node) => node.props?.['aria-label'])
+const expertFormTextareas = collectByType(expertForm, 'textarea').map((node) => node.props?.['aria-label'])
+check(
+  '新建专家表单：标识/显示名/定位/描述 + 能力/流程/输出/红线都在',
+  ['专家标识', '专家显示名', '专家定位', '专家描述'].every((label) => expertFormInputs.includes(label)) &&
+    ['核心能力', '工作流程', '输出规范', '专家注意事项'].every((label) => expertFormTextareas.includes(label)),
+  { inputs: expertFormInputs, textareas: expertFormTextareas },
+)
+check('新建专家表单会说明落到哪个目录', collectText(expertForm).join(' ').includes('C:\\h\\agents'))
+const teamForm = withInjectedState({ 0: sampleExpertData, 5: 'team' }, () => renderComponent('ExpertsModule', expertProps, 'ExpertsModule（新建专家团）'))
+const teamText = collectText(teamForm).join(' ')
+check(
+  '新建专家团表单：能点选成员、指定团长、写协作流程',
+  teamText.includes('选成员') && teamText.includes('团长') && teamText.includes('协作流程') && teamText.includes('老陈（Java 后端开发专家）'),
+  teamText.slice(0, 200),
+)
+const expertsEmpty = withInjectedState({ 0: { experts: [], teams: [] } }, () => renderComponent('ExpertsModule', { ...expertProps, expertData: null }, 'ExpertsModule（没有专家）'))
+check('没有专家时给引导语', collectText(expertsEmpty).join(' ').includes('还没有专家'))
+check('左侧导航有「专家与专家团」入口', collectText(railFrame).join(' ').includes('专家与专家团'), collectText(railFrame).join(' ').slice(0, 120))
+
+/* 交付指令里带上选中的专家 / 专家团 */
+const pickExpert = pure.resolveExpertPick?.({ expert: 'agent:java-backend-expert' }, sampleExpertData)
+const pickTeam = pure.resolveExpertPick?.({ expert: 'team:hr-delivery-team' }, sampleExpertData)
+check(
+  '选中的专家解析成角色信息（含角色定义文件路径）',
+  pickExpert?.displayName === '老陈' && pickExpert?.profession === 'Java 后端开发专家' && pickExpert?.kind === 'expert' && String(pickExpert?.path).endsWith('java-backend-expert.md'),
+  pickExpert,
+)
+check('选中的专家团带上团长与成员明细', pickTeam?.kind === 'team' && pickTeam?.lead === 'java-backend-expert' && (pickTeam?.memberDetails ?? []).length === 2, { lead: pickTeam?.lead, n: pickTeam?.memberDetails?.length })
+check('没选专家时不注入角色信息', pure.resolveExpertPick?.({ expert: '' }, sampleExpertData) === null)
+const expertInstruction = pure.buildInstruction?.(sampleItem, { projectDir: 'D:\\p' }, null, pickExpert)
+check(
+  '开发指令开头写上「以某专家身份」+ 角色定义文件',
+  String(expertInstruction).startsWith('请你以「老陈 · Java 后端开发专家」这个专家的身份来完成下面这条开发需求。') && String(expertInstruction).includes('角色定义文件：C:\\h\\agents\\java-backend-expert.md'),
+  String(expertInstruction).slice(0, 150),
+)
+const teamInstruction = pure.buildInstruction?.(sampleItem, { projectDir: 'D:\\p' }, null, pickTeam)
+check(
+  '专家团指令写出分工、团长与协作流程',
+  String(teamInstruction).includes('按「HR 交付专家团」这个专家团的分工') && String(teamInstruction).includes('（团长）') && String(teamInstruction).includes('1. 团长拆需求'),
+  String(teamInstruction).slice(0, 280),
+)
+check('不选专家时指令保持原样（不出现角色设定）', !String(pure.buildInstruction?.(sampleItem, { projectDir: 'D:\\p' }, null, null)).includes('这个专家的身份'))
 
 /* ------------------------------------- 多表：需求池 + 开发任务表（新） */
 
