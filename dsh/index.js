@@ -409,6 +409,85 @@ const recordCache = new Map()
 const RECORD_CACHE_MS = 60_000
 
 /** 读一张表的原始记录（60 秒内存缓存，可 fresh 强制刷新）。 */
+/**
+ * lark-cli 的 `--output` 只认三个根：当前工作目录、账号临时目录、home 下的 files。
+ * 写到 DSH 数据目录会被判为 "unsafe output path"（退出码 2），所以这里统一落临时目录，
+ * 读完立刻删。文件名带随机后缀，避免同一张表并发读时互相覆盖。
+ */
+function larkOutputFile(tableId, label = 'records') {
+  const safe = String(tableId).replace(/[^\w.-]/g, '_') || label
+  const rand = Math.random().toString(36).slice(2, 8)
+  return join(tmpdir(), `dsh-rdw-pull-${safe}-${Date.now().toString(36)}-${rand}.ndjson`)
+}
+
+/** 从 lark-cli 的 stderr/stdout 里摘一小段人话，用于报错。 */
+function larkSnippet(result) {
+  return String(result?.stderr || result?.stdout || '').trim().slice(0, 400)
+}
+
+/** 删掉一次 ndjson 拉取留下的全部文件：本体 + lark-cli 伴生的 .manifest.json。 */
+async function cleanupLarkOutput(outFile) {
+  const manifest = String(outFile).replace(/\.ndjson$/, '.manifest.json')
+  await rm(outFile, { force: true }).catch(() => {})
+  if (manifest !== outFile) await rm(manifest, { force: true }).catch(() => {})
+}
+
+/**
+ * 读一张表的记录：ndjson 优先，只有 ndjson **真的坏了** 才退回值矩阵。
+ *
+ * 关键区分（v3.7.1 修正）：ndjson 正常退出、文件也写出来了，只是 0 条记录 —— 那多半是
+ * 这张表本来就是空的，不该报「通道不可用」。所以此时再用值矩阵交叉确认一次：
+ * 值矩阵也 0 条 → 安静地按空表显示；值矩阵有数据 → 用值矩阵并说明原因。
+ * 返回 { records, fetchMode, warning, ndjsonError, failure }，failure 非空表示读失败要报错。
+ */
+async function readRecordsWithFallback({ wrapper, common, outFile, limit = 2000, matrixReader, command = '' }) {
+  const ndjson = await runLark(wrapper, [...common, '--limit', String(limit), '--format', 'ndjson', '--output', outFile, '--overwrite'])
+  // 退出码不可全信：.cmd 包装下 lark-cli 会以非 0 退出，但 ndjson 文件其实写好了。以文件里的记录为准。
+  const ndjsonText = await readFile(outFile, 'utf8').catch(() => null)
+  // lark-cli 除了 ndjson 还会写一个伴生的 .manifest.json，两个都要清掉，别在临时目录留垃圾。
+  await cleanupLarkOutput(outFile)
+  const records = ndjsonText === null ? [] : parseLarkRecords(ndjsonText)
+  let ndjsonError = ''
+  if (ndjsonText === null) ndjsonError = `lark-cli 没写出 ndjson 文件（退出码 ${ndjson.code ?? '?'}）：${larkSnippet(ndjson)}`
+  else if (!ndjson.ok) ndjsonError = `lark-cli 退出码 ${ndjson.code ?? '?'}：${larkSnippet(ndjson)}`
+  if (records.length) {
+    return {
+      records,
+      fetchMode: 'ndjson',
+      warning: ndjson.ok ? '' : `lark-cli 退出码 ${ndjson.code ?? '?'}，但 ndjson 里已有 ${records.length} 条记录，按记录显示。`,
+      ndjsonError,
+      failure: null,
+    }
+  }
+  // ndjson 一条都没有：用值矩阵交叉确认「表是空的」还是「通道坏了」。
+  const json = await runLark(wrapper, [...common, '--limit', '200', '--format', 'json'])
+  if (!json.ok) {
+    if (ndjsonError) {
+      return { records: [], fetchMode: 'ndjson', warning: '', ndjsonError, failure: { error: '读取飞书多维表格失败', detail: (json.stderr || json.stdout || ndjsonError).trim().slice(0, 1500), command } }
+    }
+    return { records: [], fetchMode: 'ndjson', warning: `值矩阵通道这次没读到（${larkSnippet(json) || '无输出'}），本次按 0 条显示。`, ndjsonError, failure: null }
+  }
+  const matrix = await matrixReader(json.stdout)
+  if (!matrix.aligned) {
+    // 值矩阵没法对齐字段：宁可报错，也不能显示串了位的字段。
+    if (ndjsonError) {
+      return { records: [], fetchMode: 'ndjson', warning: '', ndjsonError, failure: { error: '这张表读到的列和字段名对不上，已停下不展示（避免显示错的字段）', detail: `${matrix.reason}；ndjson 通道失败原因：${ndjsonError}`, command } }
+    }
+    return { records: [], fetchMode: 'ndjson', warning: '', ndjsonError, failure: null }
+  }
+  if (!matrix.records.length) {
+    // 两个通道都读到 0 条：这张表就是空的（不是通道坏），安静显示。
+    return { records: [], fetchMode: 'ndjson', warning: '', ndjsonError: '', failure: null }
+  }
+  return {
+    records: matrix.records,
+    fetchMode: 'json',
+    warning: `ndjson 通道没解析到记录，已用值矩阵读到 ${matrix.records.length} 条（${matrix.reason}）。${ndjsonError ? `ndjson 失败原因：${ndjsonError.slice(0, 200)}` : ''}`,
+    ndjsonError,
+    failure: null,
+  }
+}
+
 async function fetchTableRecords(config, table, { fresh = false, limit = 2000 } = {}) {
   const cacheId = `${config.root}|${table.key}`
   const hit = recordCache.get(cacheId)
@@ -417,50 +496,18 @@ async function fetchTableRecords(config, table, { fresh = false, limit = 2000 } 
   const wrapper = shellWrapper(larkCli)
   const common = ['base', '+record-list', '--base-token', table.baseToken, '--table-id', table.tableId, '--as', table.identity]
   if (table.viewId) common.push('--view-id', table.viewId)
-  const pullDir = join(config.root, 'pull')
-  await mkdir(pullDir, { recursive: true })
-  const outFile = join(pullDir, `${String(table.tableId).replace(/[^\w.-]/g, '_') || 'records'}.ndjson`)
-  const ndjson = await runLark(wrapper, [...common, '--limit', String(limit), '--format', 'ndjson', '--output', outFile, '--overwrite'])
-  // 退出码不可全信：.cmd 包装下 lark-cli 会以非 0 退出，但 ndjson 文件其实写好了。以文件里的记录为准。
-  const ndjsonText = await readFile(outFile, 'utf8').catch(() => '')
-  await rm(outFile, { force: true }).catch(() => {})
-  let records = parseLarkRecords(ndjsonText)
-  let fetchMode = 'ndjson'
-  let warning = ''
-  let ndjsonError = ''
-  if (!records.length) {
-    ndjsonError = ndjson.ok ? 'ndjson 输出里没有解析到记录' : `lark-cli 退出码 ${ndjson.code ?? '?'}：${(ndjson.stderr || ndjson.stdout || '').trim().slice(0, 400)}`
-  } else if (!ndjson.ok) {
-    warning = `lark-cli 退出码 ${ndjson.code ?? '?'}，但 ndjson 文件里已有 ${records.length} 条记录，按记录显示。`
+  const read = await readRecordsWithFallback({
+    wrapper,
+    common,
+    outFile: larkOutputFile(table.tableId, 'records'),
+    limit,
+    command: `lark-cli base +record-list --base-token ${table.baseToken} --table-id ${table.tableId} --as ${table.identity} --format ndjson`,
+    matrixReader: (stdout) => matrixToRecords(wrapper, table, stdout),
+  })
+  if (read.failure) {
+    return { ok: false, records: [], error: read.failure.error, detail: read.failure.detail, command: read.failure.command }
   }
-  if (!records.length) {
-    fetchMode = 'json'
-    const json = await runLark(wrapper, [...common, '--limit', '200', '--format', 'json'])
-    if (!json.ok) {
-      return {
-        ok: false,
-        records: [],
-        error: '读取飞书多维表格失败',
-        detail: (json.stderr || json.stdout || ndjsonError || '').trim().slice(0, 1500),
-        command: `lark-cli base +record-list --base-token ${table.baseToken} --table-id ${table.tableId} --as ${table.identity}`,
-      }
-    }
-    const matrix = await matrixToRecords(wrapper, table, json.stdout)
-    if (!matrix.aligned) {
-      // 值矩阵没法对齐字段：宁可报错，也不能显示串了位的字段。
-      return {
-        ok: false,
-        records: [],
-        error: '这张表读到的列和字段名对不上，已停下不展示（避免显示错的字段）',
-        detail: `${matrix.reason}；ndjson 通道失败原因：${ndjsonError || '未知'}`,
-        command: `lark-cli base +record-list --base-token ${table.baseToken} --table-id ${table.tableId} --as ${table.identity} --format ndjson`,
-      }
-    }
-    records = matrix.records
-    warning = `ndjson 通道不可用，已退回值矩阵并按选项值校正列顺序（${matrix.reason}）。`
-    if (ndjsonError) warning += `ndjson 失败原因：${ndjsonError.slice(0, 200)}`
-  }
-  const payload = { ok: true, records, fetchMode, warning, ndjsonError, at: Date.now() }
+  const payload = { ok: true, records: read.records, fetchMode: read.fetchMode, warning: read.warning, ndjsonError: read.ndjsonError, at: Date.now() }
   recordCache.set(cacheId, { at: Date.now(), payload })
   return payload
 }
@@ -928,51 +975,18 @@ async function fetchRequirements(config, settings) {
   ]
   if (source.viewId) common.push('--view-id', source.viewId)
 
-  const pullDir = join(config.root, 'pull')
-  await mkdir(pullDir, { recursive: true })
-  const outFile = join(pullDir, `${String(source.tableId).replace(/[^\w.-]/g, '_') || 'records'}.ndjson`)
-
-  const ndjson = await runLark(wrapper, [...common, '--limit', '2000', '--format', 'ndjson', '--output', outFile, '--overwrite'])
-  // 同上：.cmd 包装下退出码可能非 0，但文件里有记录就照样用。
-  const ndjsonText = await readFile(outFile, 'utf8').catch(() => '')
-  await rm(outFile, { force: true }).catch(() => {})
-  let records = parseLarkRecords(ndjsonText)
-  let fetchMode = 'ndjson'
-  let warning = ''
-  let ndjsonError = ''
-  if (!records.length) {
-    ndjsonError = ndjson.ok ? 'ndjson 输出里没有解析到记录' : `lark-cli 退出码 ${ndjson.code ?? '?'}：${(ndjson.stderr || ndjson.stdout || '').trim().slice(0, 400)}`
-  } else if (!ndjson.ok) {
-    warning = `lark-cli 退出码 ${ndjson.code ?? '?'}，但 ndjson 文件里已有 ${records.length} 条记录，按记录显示。`
+  const read = await readRecordsWithFallback({
+    wrapper,
+    common,
+    outFile: larkOutputFile(source.tableId, 'source-records'),
+    limit: 2000,
+    command: `${describeRead(source)} --format ndjson`,
+    matrixReader: (stdout) => matrixToRecords(wrapper, source, stdout),
+  })
+  if (read.failure) {
+    return { configured: true, items: [], source: described, error: read.failure.error, detail: read.failure.detail, command: read.failure.command }
   }
-  if (!records.length) {
-    fetchMode = 'json'
-    const json = await runLark(wrapper, [...common, '--limit', '200', '--format', 'json'])
-    if (!json.ok) {
-      return {
-        configured: true,
-        items: [],
-        source: described,
-        error: '读取飞书多维表格失败',
-        detail: (json.stderr || json.stdout || ndjsonError || '').trim().slice(0, 1500),
-        command: describeRead(source),
-      }
-    }
-    const matrix = await matrixToRecords(wrapper, source, json.stdout)
-    if (!matrix.aligned) {
-      return {
-        configured: true,
-        items: [],
-        source: described,
-        error: '这张表读到的列和字段名对不上，已停下不展示（避免显示错的字段）',
-        detail: `${matrix.reason}；ndjson 通道失败原因：${ndjsonError || '未知'}`,
-        command: `${describeRead(source)} --format ndjson`,
-      }
-    }
-    records = matrix.records
-    warning = `ndjson 通道不可用，已退回值矩阵并按选项值校正列顺序（${matrix.reason}）。`
-    if (ndjsonError) warning += `ndjson 失败原因：${ndjsonError.slice(0, 200)}`
-  }
+  const { records, fetchMode, warning } = read
 
   const items = records.map((record) => normalizeRecord(record, settings, source.fieldMap))
   return { configured: true, items, count: items.length, source: described, fetchMode, warning }

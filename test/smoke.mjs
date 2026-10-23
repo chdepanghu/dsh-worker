@@ -9,7 +9,7 @@
  * 运行：node test/smoke.mjs
  */
 import { EventEmitter } from 'node:events'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, alignMatrixColumns, buildBatchUpdatePayload, cellValueFor, matrixShape, normalizeRecord, parseBaseInput, parseLarkRecords, recordsFromMatrix, renderExpertMarkdown, renderSkillMarkdown, slugifySkillName } from '../dsh/index.js'
@@ -1166,6 +1166,133 @@ check(
 )
 check('不选专家时指令保持原样（不出现角色设定）', !String(pure.buildInstruction?.(sampleItem, { projectDir: 'D:\\p' }, null, null)).includes('这个专家的身份'))
 
+/* ------------------------- 对话输入框里的「＋ 专家」（挂在宿主 slot 上，v3.7.1 新） */
+
+console.log('\n[6f] 对话输入框「＋」那排引入专家')
+check(
+  '开场白：以专家身份开工 + 带上角色定义文件',
+  String(pure.expertOpenerText?.(pickExpert)).startsWith('请以「老陈 · Java 后端开发专家」的身份帮我继续；角色定义：') &&
+    String(pure.expertOpenerText?.(pickExpert)).includes('java-backend-expert.md'),
+  pure.expertOpenerText?.(pickExpert),
+)
+check('开场白：专家团按分工接力', String(pure.expertOpenerText?.(pickTeam)).includes('「HR 交付专家团」') && String(pure.expertOpenerText?.(pickTeam)).includes('按分工接手'), pure.expertOpenerText?.(pickTeam))
+check('没选角色时开场白为空', pure.expertOpenerText?.(null) === '' && pure.expertOpenerText?.(undefined) === '')
+check(
+  '详情页的「复制开场白」与输入框入口措辞同源（只有一处实现）',
+  clientSource.includes('function expertOpenerText(pick)') && clientSource.includes('const intro = expertOpenerText(expertPick)'),
+)
+
+// 宿主桩：fetch（读 /experts、写 /settings）+ inputActions（宿主给 slot 条目的标准 props）+ 剪贴板
+const entryFetchCalls = []
+const entryInsertCalls = []
+const entryClipboard = []
+let entryInsertAccepts = true
+globalThis.fetch = async (url, options) => {
+  entryFetchCalls.push({ url: String(url), body: String(options?.body ?? '') })
+  const payload = String(url).includes('/experts') ? sampleExpertData : { ok: true }
+  return { ok: true, status: 200, text: async () => JSON.stringify(payload) }
+}
+// Node 24 自带只读的 globalThis.navigator（只有 userAgent 等），剪贴板要自己定义上去。
+Object.defineProperty(globalThis, 'navigator', { value: { clipboard: { writeText: async (text) => { entryClipboard.push(text) } } }, configurable: true, writable: true })
+const entryInputActions = {
+  captureInsertion: () => ({ span: 'stub-span' }),
+  insertText: (text, span) => {
+    entryInsertCalls.push({ text, span })
+    return entryInsertAccepts
+  },
+}
+const entryClosed = withInjectedState({ 0: false }, () => renderComponent('ExpertComposerEntry', { inputActions: entryInputActions }, '输入框入口（收起）'))
+check(
+  '收起态就是一个「＋ 专家」小按钮（不占地方）',
+  collectText(entryClosed).join(' ').includes('＋ 专家') && collectByType(entryClosed, 'button').length === 1 && collectByType(entryClosed, 'div')[0]?.props?.className === 'rdw-expert-entry',
+  collectText(entryClosed).join(' '),
+)
+const entryOpen = withInjectedState({ 0: true, 1: sampleExpertData }, () => renderComponent('ExpertComposerEntry', { inputActions: entryInputActions }, '输入框入口（展开）'))
+const entryOpenText = collectText(entryOpen).join(' ')
+check(
+  '展开后列出专家与专家团，并有「不用专家」',
+  entryOpenText.includes('这轮对话交给谁？') && entryOpenText.includes('老陈 · Java 后端开发专家') && entryOpenText.includes('HR 交付专家团') && entryOpenText.includes('不用专家'),
+  entryOpenText.slice(0, 200),
+)
+const entryOptions = collectByType(entryOpen, 'button').filter((node) => String(node.props?.className ?? '').includes('rdw-expert-option'))
+check('专家与专家团都是可点选项', entryOptions.length === 4, entryOptions.map((node) => collectText(node).join(' ')))
+const entrySelected = withInjectedState({ 0: true, 1: { ...sampleExpertData, selected: 'agent:java-backend-expert' } }, () =>
+  renderComponent('ExpertComposerEntry', { inputActions: entryInputActions }, '输入框入口（已选专家）'),
+)
+check('已选专家时按钮上显示当前是谁', collectText(entrySelected).join(' ').includes('＋ 专家 · 老陈'), collectText(entrySelected).join(' ').slice(0, 80))
+
+const expertOption = entryOptions.find((node) => collectText(node).join(' ').includes('老陈'))
+await expertOption?.props?.onClick?.()
+check(
+  '点专家：开场白被写进对话输入框（一次可撤销插入）',
+  entryInsertCalls.length === 1 && String(entryInsertCalls[0].text).includes('老陈') && entryInsertCalls[0].span?.span === 'stub-span',
+  entryInsertCalls,
+)
+check(
+  '点专家：同时记进工作台设置（开发指令也带上这个角色）',
+  entryFetchCalls.some((call) => call.url.endsWith('/settings') && call.body.includes('agent:java-backend-expert')),
+  entryFetchCalls.map((call) => `${call.url} ${call.body}`),
+)
+
+// 编辑器拒绝插入（或宿主没给 inputActions）时，必须退回复制，不能吞掉结果
+entryInsertAccepts = false
+entryInsertCalls.length = 0
+entryClipboard.length = 0
+const teamOption = entryOptions.find((node) => collectText(node).join(' ').includes('HR 交付专家团'))
+await teamOption?.props?.onClick?.()
+check(
+  '插入被拒时退回剪贴板（结果不丢）',
+  entryClipboard.length === 1 && String(entryClipboard[0]).includes('HR 交付专家团'),
+  { insertCalls: entryInsertCalls.length, clipboard: entryClipboard.map((text) => String(text).slice(0, 60)) },
+)
+entryInsertAccepts = true
+const entryNoActions = withInjectedState({ 0: true, 1: sampleExpertData }, () => renderComponent('ExpertComposerEntry', {}, '输入框入口（宿主没给 inputActions）'))
+check('宿主没给 inputActions 时照常渲染（入口不崩）', Boolean(entryNoActions?.type))
+
+// 注册：工作台要靠 slots.inject('conversation.input.left') 挂到那排「＋」旁边
+const slotRegistrations = []
+const slotInjected = []
+const fakeSlotsCtx = {
+  get: () => undefined,
+  effect: (callback) => callback(),
+  desktopWorkbenches: { register: () => () => {} },
+  slots: {
+    inject: (key, callback) => {
+      slotInjected.push(key)
+      callback()
+    },
+    register: (meta, render) => {
+      slotRegistrations.push({ meta, render })
+      return () => {}
+    },
+  },
+}
+let applyThrew = false
+try {
+  clientModule?.apply?.(fakeSlotsCtx)
+} catch (error) {
+  applyThrew = true
+}
+check(
+  '工作台把自己挂到宿主对话输入框的「＋」那排',
+  !applyThrew && slotInjected.includes('conversation.input.left') && slotRegistrations[0]?.meta?.id === 'rdw-expert-entry' && slotRegistrations[0]?.meta?.name === 'conversation.input.left',
+  { injected: slotInjected, meta: slotRegistrations[0]?.meta },
+)
+const slotEntryElement = slotRegistrations[0]?.render?.({ inputActions: entryInputActions })
+check(
+  '宿主渲染这个入口时，拿到的是专家入口组件（并带着宿主给的 inputActions）',
+  slotEntryElement?.type === components.ExpertComposerEntry && Boolean(slotEntryElement?.props?.inputActions) && slotEntryElement?.props?.inputActions === entryInputActions,
+  slotEntryElement?.type?.name ?? slotEntryElement?.type,
+)
+let degradeThrew = false
+try {
+  clientModule?.apply?.({ get: () => undefined, effect: (callback) => callback(), desktopWorkbenches: { register: () => () => {} } })
+} catch {
+  degradeThrew = true
+}
+check('宿主没有 slots 服务时工作台照常加载（入口静默跳过）', !degradeThrew)
+
+
 /* ------------------------------------- 多表：需求池 + 开发任务表（新） */
 
 console.log('\n[7] 多张飞书表：清单 / 表结构 / 跨表总览')
@@ -1216,10 +1343,32 @@ if (taskRecords.json?.error) {
   warn('读开发任务表失败（环境/权限问题）', String(taskRecords.json.detail || '').slice(0, 200))
 } else {
   check('读开发任务表记录', taskRecords.status === 200 && taskRecords.json?.table?.kind === 'task' && Array.isArray(taskRecords.json?.items), { count: taskRecords.json?.count })
+  // 用户报过的坑：表是空的（0 条）被当成「ndjson 通道不可用」，点开就弹一段吓人的警告。
+  // ndjson 正常退出、文件也写出来了，就该按 ndjson 通道显示 0 条，而不是退回值矩阵。
+  check(
+    '空表不再被当成「通道不可用」（ndjson 正常就是 0 条）',
+    taskRecords.json?.fetchMode === 'ndjson' && !taskRecords.json?.warning,
+    { fetchMode: taskRecords.json?.fetchMode, warning: taskRecords.json?.warning, count: taskRecords.json?.count },
+  )
   if (taskRecords.json?.items?.length) {
     console.log(`       任务样例：${taskRecords.json.items.slice(0, 3).map((item) => `${item.code || '-'} ${item.title} [${item.status || '-'}] ${item.module || ''}`.trim()).join(' ｜ ')}`)
   }
 }
+
+// lark-cli 的 --output 只认「当前工作目录 / 账号临时目录 / home 下的 files」，
+// 写到工作台数据目录会被判 unsafe output path（退出码 2）——所以必须落临时目录。
+const serverSource = await readClient(new URL('../dsh/index.js', import.meta.url), 'utf8')
+check(
+  'ndjson 落在账号临时目录（不再写工作台数据目录）',
+  serverSource.includes('larkOutputFile') && serverSource.includes('join(tmpdir()') && !serverSource.includes("join(config.root, 'pull')"),
+)
+check(
+  'ndjson 失败与「表本来就是空的」分开判断',
+  serverSource.includes('readRecordsWithFallback') && serverSource.includes('这张表就是空的') && !serverSource.includes('ndjson 输出里没有解析到记录'),
+)
+const tmpLeftover = (await readdir(tmpdir())).filter((name) => String(name).startsWith('dsh-rdw-pull-'))
+check('读完就删，临时目录不留 ndjson 垃圾', tmpLeftover.length === 0, tmpLeftover.slice(0, 5))
+
 
 const taskSchema = await call('GET', `/fields?table=${encodeURIComponent('task:dahua-skill-service')}`)
 check('读开发任务表的表结构', taskSchema.status === 200 && (taskSchema.json?.fields?.length ?? 0) > 0, (taskSchema.json?.fields ?? []).map((field) => field.name).slice(0, 6))
