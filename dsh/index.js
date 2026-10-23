@@ -406,6 +406,8 @@ export async function findTable(config, settings, key) {
 }
 
 const recordCache = new Map()
+// 最近一次上报的会话 id（来自对话输入框的专家入口），只存内存，不落盘、不含任何凭证。
+let composerSession = { id: '', at: 0 }
 const RECORD_CACHE_MS = 60_000
 
 /** 读一张表的原始记录（60 秒内存缓存，可 fresh 强制刷新）。 */
@@ -1495,7 +1497,18 @@ async function listExperts(config, settings) {
   for (const file of teamFiles(config, settings)) teams.push(...(await readTeamFile(file)))
   const summary = { harness: 0, global: 0, project: 0, custom: 0 }
   for (const expert of experts) if (expert.scope in summary) summary[expert.scope] += 1
-  return { experts, teams, agentDirs, summary, duplicates: found.length - experts.length, selected: String(settings.expert ?? ''), targets: expertTargets(config, settings), projectDir: settings.projectDir }
+  return {
+    experts,
+    teams,
+    agentDirs,
+    summary,
+    duplicates: found.length - experts.length,
+    selected: String(settings.expert ?? ''),
+    targets: expertTargets(config, settings),
+    // 「交给 AI 完善并创建」要把落盘位置原样告诉 agent，所以把专家团清单文件的绝对路径也带出去。
+    teamFiles: teamFiles(config, settings),
+    projectDir: settings.projectDir,
+  }
 }
 
 /** 生成一份专家角色定义（frontmatter 用扁平键，正文参考 WorkBuddy 的四段式）。 */
@@ -1831,6 +1844,19 @@ export function apply(ctx, config) {
       if (route === '/experts' && req.method === 'GET') {
         const settings = await readSettings(config)
         return sendJson(res, 200, await listExperts(config, settings))
+      }
+
+      // 对话输入框那个「＋ 专家」入口知道自己是哪个会话（宿主 slot 会给 sessionId），
+      // 工作台要「把养专家的指令发进当前对话」就得先知道会话是谁：入口上报、面板取用。
+      if (route === '/composer/session' && req.method === 'POST') {
+        const body = await readBody(req)
+        const sessionId = String(body?.sessionId ?? '').trim().slice(0, 200)
+        if (sessionId) composerSession = { id: sessionId, at: Date.now() }
+        return sendJson(res, 200, { ok: true, sessionId: composerSession.id })
+      }
+
+      if (route === '/composer/session' && req.method === 'GET') {
+        return sendJson(res, 200, { ok: true, sessionId: composerSession.id, at: composerSession.at })
       }
 
       if (route === '/expert/create' && req.method === 'POST') {

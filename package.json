@@ -1,6 +1,6 @@
 {
   "name": "dsh-requirement-dev-workbench",
-  "version": "3.7.2",
+  "version": "3.8.0",
   "private": true,
   "type": "module",
   "description": "需求开发工作台：跨多张飞书多维表格看开发任务、进度与 AI 交付情况（总览 + 清单 + 卡片看板 + 进度视图，模块可扩展），选中本地项目后一键生成开发指令，并可浏览项目/全局 skill 与开发规范。",

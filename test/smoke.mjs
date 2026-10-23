@@ -1300,6 +1300,177 @@ check('宿主没有 slots 服务时工作台照常加载（入口静默跳过）
 
 /* ------------------------------------- 多表：需求池 + 开发任务表（新） */
 
+console.log('\n[6g] 创建专家 / 专家团：一句话描述，交给 AI 按专业流程完善并落盘')
+const enrichExpert = String(
+  pure.expertEnrichmentPrompt?.({
+    mode: 'expert',
+    description: '一个盯支付对账的后端专家',
+    id: 'pay-recon-expert',
+    displayName: '老付',
+    dir: 'C:\\h\\agents',
+  }) ?? '',
+)
+check(
+  '养成指令：用户那句话原样带上，并说明这是唯一输入',
+  enrichExpert.includes('一个盯支付对账的后端专家') && enrichExpert.includes('唯一输入') && enrichExpert.includes('pay-recon-expert.md'),
+  enrichExpert.slice(0, 200),
+)
+check(
+  '养成指令：给出标准角色定义格式（frontmatter + 四段 + 我的假设）',
+  ['description:', 'displayName: 老付', 'profession:', '## 核心能力', '## 工作流程', '## 输出规范', '## 注意事项', '## 我的假设'].every((part) => enrichExpert.includes(part)),
+)
+check(
+  '养成指令：内置 6 步专业流程',
+  ['定位与边界', '能力清单', '工作流程', '输出规范', '红线与自检', '触发场景'].every((part) => enrichExpert.includes(part)),
+)
+check(
+  '养成指令：明令不许反问用户（信息不足按专业判断补齐）',
+  enrichExpert.includes('不要反问用户') && enrichExpert.includes('不要要求确认') && enrichExpert.includes('专业判断'),
+)
+check(
+  '养成指令：要求直接落盘、只报绝对路径、不顺手改别的文件',
+  enrichExpert.includes('直接落盘') && enrichExpert.includes('绝对路径') && enrichExpert.includes('不要顺手改项目里其它文件'),
+)
+const enrichTeam = String(
+  pure.expertEnrichmentPrompt?.({
+    mode: 'team',
+    description: '要一个从需求到评审一条龙的团队',
+    teamFile: 'C:\\h\\experts\\teams.json',
+    dir: 'C:\\h\\agents',
+    existingExperts: [{ agentId: 'java-developer' }, { agentId: 'java-reviewer' }],
+  }) ?? '',
+)
+check(
+  '养成指令（专家团）：写清清单文件与团长/成员/流程字段',
+  enrichTeam.includes('C:\\h\\experts\\teams.json') && ['members', 'lead', 'flow', 'createdAt'].every((part) => enrichTeam.includes(part)),
+)
+check(
+  '养成指令（专家团）：已有的专家提示复用，别重复造',
+  enrichTeam.includes('java-developer') && enrichTeam.includes('java-reviewer') && enrichTeam.includes('不要重复造'),
+)
+
+const sessionSends = []
+const stubSession = {
+  prompt: async (parts, mode) => {
+    sessionSends.push({ parts, mode })
+    return { ok: true, value: { accepted: true } }
+  },
+}
+const sentViaBinding = await pure.promptCurrentSession({ binding: (id) => (id === 'sess-1' ? { session: stubSession } : undefined) }, 'sess-1', '指令正文')
+check(
+  '发得进当前对话：sessions.binding(id).session.prompt(…, queue)',
+  sentViaBinding.ok === true && sessionSends.length === 1 && sessionSends[0].mode === 'queue' && sessionSends[0].parts?.[0]?.text === '指令正文',
+  { sent: sentViaBinding, calls: sessionSends.length },
+)
+let sessionReleased = 0
+const sentViaRetain = await pure.promptCurrentSession(
+  {
+    retain: () => ({
+      ready: Promise.resolve({ session: stubSession }),
+      release: () => {
+        sessionReleased += 1
+      },
+    }),
+  },
+  'sess-2',
+  '指令正文 2',
+)
+check('binding 拿不到时用 retain，用完释放', sentViaRetain.ok === true && sessionReleased === 1 && sessionSends.length === 2, { sent: sentViaRetain, sessionReleased })
+const noService = await pure.promptCurrentSession(undefined, 'sess-1', 'x')
+const noSessionId = await pure.promptCurrentSession({ binding: () => ({ session: stubSession }) }, '', 'x')
+check(
+  '拿不到发送能力 / 还不知道会话时：老实返回失败（外层退回复制）',
+  noService.ok === false && Boolean(noService.reason) && noSessionId.ok === false && String(noSessionId.reason).includes('当前对话'),
+  { noService, noSessionId },
+)
+const refused = await pure.promptCurrentSession({ binding: () => ({ session: { prompt: async () => ({ ok: false, error: { message: '会话已归档' } }) } }) }, 'sess-3', 'x')
+check('宿主拒绝发送时如实返回原因（不假装成功）', refused.ok === false && String(refused.reason).includes('会话已归档'), refused)
+
+const aiFetch = []
+globalThis.fetch = async (url, options) => {
+  const target = String(url)
+  aiFetch.push({ url: target, body: String(options?.body ?? '') })
+  const payload = target.includes('/experts') ? sampleExpertData : target.includes('/composer/session') ? { ok: true, sessionId: 'sess-42', at: 0 } : { ok: true }
+  return { ok: true, status: 200, text: async () => JSON.stringify(payload) }
+}
+const aiExpertData = { ...sampleExpertData, teamFiles: [{ scope: 'harness', path: 'C:\\h\\experts\\teams.json', label: '通用专家团' }] }
+const aiProps = {
+  state: { settings: {} },
+  reloadState: async () => {},
+  expertData: aiExpertData,
+  reloadExperts: async () => {},
+  service: { sessions: { binding: () => ({ session: stubSession }) } },
+}
+const aiPanel = withInjectedState(
+  { 0: aiExpertData, 9: 'expert', 10: { description: '一个盯支付对账的后端专家', id: 'pay-recon-expert', displayName: '老付', scope: 'harness' } },
+  () => renderComponent('ExpertsModule', aiProps, '新建专家（交给 AI 完善）'),
+)
+const aiText = collectText(aiPanel).join(' ')
+check(
+  '新建专家默认是「一句话描述 + 交给 AI 完善并创建」，不再逼你填技术字段',
+  aiText.includes('交给 AI 完善并创建') && aiText.includes('一句话就够') && !aiText.includes('职业/定位'),
+  aiText.slice(0, 240),
+)
+check('面板写明：AI 不会反问你，会自己补齐并把假设写在文件末尾', aiText.includes('不会反问你') && aiText.includes('我的假设'))
+check('面板写明落盘位置（通用/项目可切）', aiText.includes('落盘目录') && aiText.includes('C:\\h\\agents'))
+const aiCreateBtn = collectByType(aiPanel, 'button').find((node) => collectText(node).join(' ').includes('交给 AI 完善并创建'))
+sessionSends.length = 0
+await aiCreateBtn?.props?.onClick?.()
+check(
+  '点「交给 AI 完善并创建」：养成指令真被发进当前对话（agent 模式开跑）',
+  sessionSends.length === 1 &&
+    String(sessionSends[0].parts?.[0]?.text).includes('一个盯支付对账的后端专家') &&
+    String(sessionSends[0].parts?.[0]?.text).includes('pay-recon-expert.md') &&
+    sessionSends[0].mode === 'queue',
+  { sends: sessionSends.length, mode: sessionSends[0]?.mode },
+)
+check('发送前先问工作台「当前是哪个对话」', aiFetch.some((item) => item.url.includes('/composer/session')), aiFetch.map((item) => item.url))
+const aiTeamPanel = withInjectedState({ 0: aiExpertData, 9: 'team', 10: { description: '要一个一条龙交付的团队', scope: 'harness' } }, () =>
+  renderComponent('ExpertsModule', aiProps, '新建专家团（交给 AI 完善）'),
+)
+const aiTeamText = collectText(aiTeamPanel).join(' ')
+check(
+  '专家团走同一条路：一句话 + 交给 AI 完善，并写清清单文件位置',
+  aiTeamText.includes('新建专家团 · 交给 AI 完善') && aiTeamText.includes('一句话就够') && aiTeamText.includes('C:\\h\\experts\\teams.json'),
+  aiTeamText.slice(0, 240),
+)
+
+entryClipboard.length = 0
+const aiPanelNoService = withInjectedState({ 0: aiExpertData, 9: 'expert', 10: { description: '一个盯支付对账的后端专家', scope: 'harness' } }, () =>
+  renderComponent('ExpertsModule', { state: { settings: {} }, expertData: aiExpertData, service: {} }, '新建专家（宿主没给会话服务）'),
+)
+const aiCreateBtnNoService = collectByType(aiPanelNoService, 'button').find((node) => collectText(node).join(' ').includes('交给 AI 完善并创建'))
+await aiCreateBtnNoService?.props?.onClick?.()
+check(
+  '发不出去（宿主没给会话服务）时复制养成指令兜底，结果不丢',
+  entryClipboard.length === 1 && String(entryClipboard[0]).includes('一个盯支付对账的后端专家'),
+  entryClipboard.map((text) => String(text).slice(0, 60)),
+)
+
+aiFetch.length = 0
+const entryWithSession = withInjectedState({ 0: false }, () => renderComponent('ExpertComposerEntry', { inputActions: entryInputActions, sessionId: 'sess-9' }, '输入框入口（带会话）'))
+await collectByType(entryWithSession, 'button')[0]?.props?.onClick?.()
+check(
+  '输入框入口把自己在哪个会话上报给工作台（否则不知道往哪发）',
+  aiFetch.some((item) => item.url.includes('/composer/session') && item.body.includes('sess-9')),
+  aiFetch.map((item) => `${item.url} ${item.body}`),
+)
+
+const sessionEmpty = await call('GET', '/composer/session')
+const sessionSet = await call('POST', '/composer/session', { sessionId: 'sess-from-entry' })
+const sessionRead = await call('GET', '/composer/session')
+check(
+  '/composer/session 能记住并取回「当前对话」',
+  sessionEmpty.status === 200 && sessionSet.status === 200 && sessionRead.json?.sessionId === 'sess-from-entry',
+  { empty: sessionEmpty.json, set: sessionSet.json, read: sessionRead.json },
+)
+const expertsWithTeamFiles = await call('GET', '/experts')
+check(
+  '/experts 带出专家团清单文件的绝对路径（AI 要知道写到哪）',
+  expertsWithTeamFiles.status === 200 && Array.isArray(expertsWithTeamFiles.json?.teamFiles) && expertsWithTeamFiles.json.teamFiles.every((file) => typeof file.path === 'string' && file.path),
+  expertsWithTeamFiles.json?.teamFiles,
+)
+
 console.log('\n[7] 多张飞书表：清单 / 表结构 / 跨表总览')
 await writeFile(
   join(projectDir, '.dev-task-sources.json'),
