@@ -198,6 +198,14 @@ const DEFAULT_VIEW = {
   hiddenModules: [], // 隐藏的模块
   collapsedModules: [], // 折叠的模块
   writeBackOnDrag: false, // 拖动卡片换模块时是否回写飞书
+  railWidth: 168, // 左侧模块栏宽度（可拖动调整，120~380）
+}
+
+/** 侧边栏宽度：只收 120~380 之间的整数，别的当默认值。 */
+function clampRailWidth(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number) || number <= 0) return DEFAULT_VIEW.railWidth
+  return Math.min(380, Math.max(120, Math.round(number)))
 }
 
 /** 单张表的配置切片：只接受已知键，防脏数据。 */
@@ -258,11 +266,12 @@ async function readView(config) {
             .map((item) => ({ field: item.field, values: asStringArray(item.values), text: String(item.text ?? '') }))
         : [],
       listFields: asStringArray(source.listFields),
-    cardFields: asStringArray(source.cardFields),
+      cardFields: asStringArray(source.cardFields),
       moduleOrder: asStringArray(source.moduleOrder),
       hiddenModules: asStringArray(source.hiddenModules),
       collapsedModules: asStringArray(source.collapsedModules),
       writeBackOnDrag: Boolean(source.writeBackOnDrag),
+      railWidth: clampRailWidth(source.railWidth),
     }
   } catch {
     return { ...DEFAULT_VIEW, modules: [], tables: {}, filters: [], listFields: [], cardFields: [], moduleOrder: [], hiddenModules: [], collapsedModules: [] }
@@ -295,6 +304,7 @@ async function writeView(config, patch) {
   if (Array.isArray(patch?.hiddenModules)) next.hiddenModules = asStringArray(patch.hiddenModules)
   if (Array.isArray(patch?.collapsedModules)) next.collapsedModules = asStringArray(patch.collapsedModules)
   if (typeof patch?.writeBackOnDrag === 'boolean') next.writeBackOnDrag = patch.writeBackOnDrag
+  if (patch?.railWidth !== undefined) next.railWidth = clampRailWidth(patch.railWidth)
   next.updatedAt = new Date().toISOString()
   await mkdir(dirname(viewFile(config)), { recursive: true })
   await writeFile(viewFile(config), `${JSON.stringify(next, null, 2)}\n`, 'utf8')

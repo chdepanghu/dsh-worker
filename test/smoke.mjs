@@ -594,6 +594,42 @@ const chatWrapClosed = collectByType(frameClosed, 'div').find((node) => node.pro
 check('「展开对话」把宿主原生对话挂到右侧', collectText(frameOpen).join(' ').includes('收起对话') && chatWrapOpen?.props?.style?.display === 'flex' && collectText(chatWrapOpen).join(' ').includes('原生对话占位'), chatWrapOpen?.props?.style)
 check('「收起对话」时对话区隐藏', chatWrapClosed?.props?.style?.display === 'none' && collectText(frameOpen).join(' ').includes('收起工作台'))
 
+/* 侧边栏：可拖拽调宽 + 改模块名字 */
+
+const probeFrame = (states) => withInjectedState(states, () => components.BusinessPanel(frameProps))
+const railFrame = probeFrame({ ...frameState, 3: [sampleTable] })
+const railNav = collectByType(railFrame, 'nav')[0]
+const railResizer = collectByType(railFrame, 'div').find((node) => String(node.props?.className ?? '').includes('rdw-rail-resizer'))
+check(
+  '侧边栏可拖拽调宽（拖拽条 + 宽度落在样式上，默认 168）',
+  Boolean(railNav) && String(railNav.props?.style?.flex ?? '').includes('168px') && railResizer?.props?.role === 'separator',
+  { navStyle: railNav?.props?.style, resizer: railResizer?.props?.className },
+)
+const editButtons = collectByType(railFrame, 'button').filter((node) => String(node.props?.className ?? '').includes('rdw-mod-edit'))
+check(
+  '每个表模块旁边都有「改模块名称」入口',
+  editButtons.length === 1 && String(editButtons[0].props?.title ?? '').includes('改模块名称'),
+  editButtons.map((node) => node.props?.title),
+)
+const renameProbe = (() => {
+  for (let index = 11; index <= 30; index += 1) {
+    const tried = probeFrame({ ...frameState, 3: [sampleTable], 4: { modules: [{ key: 'm1', tableKey: sampleTable.key, title: '改名测试', view: 'board' }] }, [index]: 'm1' })
+    const input = collectByType(tried, 'input').find((node) => String(node.props?.className ?? '') === 'rdw-mod-rename')
+    if (input) return { index, input }
+  }
+  return null
+})()
+check(
+  '改名：点✎后原地变成输入框（回车/失焦保存）',
+  Boolean(renameProbe) && String(renameProbe.input.props?.['aria-label'] ?? '').includes('模块名称') && typeof renameProbe.input.props?.onBlur === 'function',
+  { index: renameProbe?.index, label: renameProbe?.input?.props?.['aria-label'] },
+)
+check(
+  '纯函数：侧边栏宽度夹在 120~380',
+  pure.clampRailWidth?.(0) === 168 && pure.clampRailWidth?.(50) === 120 && pure.clampRailWidth?.(9999) === 380 && pure.clampRailWidth?.(200.6) === 201,
+  [pure.clampRailWidth?.(0), pure.clampRailWidth?.(50), pure.clampRailWidth?.(9999), pure.clampRailWidth?.(200.6)],
+)
+
 /* ------------------------------------------------------- 纯函数（页面逻辑） */
 
 console.log('\n[6c] 页面纯函数：配置切片 / 模块 / 进度口径')
@@ -738,6 +774,24 @@ check(
   viewBack.json?.view?.tables?.['requirement:dahua-skill-service'],
 )
 check('客户端有卡片字段配置入口与确认回写', clientSource.includes('卡片上展示哪些字段') && clientSource.includes('确认写回飞书'))
+
+/* 侧边栏宽度 / 模块名称：写进 view.json 并在下次打开读回 */
+
+await call('POST', '/view', { railWidth: 236 })
+const railBack = await call('GET', '/view')
+check('侧边栏宽度可保存并读回', railBack.json?.view?.railWidth === 236, railBack.json?.view?.railWidth)
+await call('POST', '/view', { railWidth: 9999 })
+check('侧边栏宽度超范围自动夹到 380', (await call('GET', '/view')).json?.view?.railWidth === 380)
+await call('POST', '/view', { railWidth: 236 })
+
+const renamePatch = await call('POST', '/view', { modules: [{ key: 'm1', tableKey: 'requirement:dahua-skill-service', title: '我的需求池', view: 'board' }] })
+check('模块名称可保存', renamePatch.status === 200 && renamePatch.json?.view?.modules?.[0]?.title === '我的需求池', renamePatch.json?.view?.modules)
+const renamed = await call('GET', '/view')
+check(
+  '模块名称按自定义值读回（不被表名覆盖）',
+  renamed.json?.view?.modules?.[0]?.title === '我的需求池' && renamed.json?.view?.modules?.[0]?.tableKey === 'requirement:dahua-skill-service',
+  renamed.json?.view?.modules?.[0],
+)
 
 const overview = await call('GET', '/overview')
 check('/overview 汇总两张表', overview.status === 200 && Array.isArray(overview.json?.tables) && overview.json.tables.length === 2, overview.json?.tables?.map((table) => ({ key: table.key, total: table.total, error: table.error })))
