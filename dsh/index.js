@@ -1601,6 +1601,270 @@ async function createTeam(config, settings, body) {
   return { ok: true, kind: 'team', id, scope, path: file.path, members, lead, overwrote: Boolean(body?.overwrite) }
 }
 
+/* ------------------------------------------------ 页面内 AI 直接创建（不走对话） */
+
+/** 模型可能把 JSON 包在代码围栏或解释文字里：剥掉围栏、截取最外层大括号再试。 */
+export function parseJsonLoose(text) {
+  const raw = String(text ?? '').trim()
+  if (!raw) return null
+  const fenced = raw
+    .replace(/^```[a-zA-Z]*\s*/, '')
+    .replace(/```\s*$/, '')
+    .trim()
+  const candidates = [fenced]
+  const start = fenced.indexOf('{')
+  const end = fenced.lastIndexOf('}')
+  if (start >= 0 && end > start) candidates.push(fenced.slice(start, end + 1))
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed
+    } catch {
+      /* 试下一种截法 */
+    }
+  }
+  return null
+}
+
+/** 取当前默认模型路由：优先会话默认，其次插件配置里的显式指定。 */
+export function resolveLlmRoute(ctx, settings) {
+  const explicitProvider = String(settings?.aiProvider ?? '').trim()
+  const explicitModel = String(settings?.aiModel ?? '').trim()
+  if (explicitProvider && explicitModel) return { provider: explicitProvider, model: explicitModel }
+  const service = typeof ctx?.get === 'function' ? ctx.get('agentDefaultModel') : undefined
+  let selection = null
+  try {
+    selection = typeof service?.currentSelection === 'function' ? service.currentSelection() : null
+  } catch {
+    selection = null
+  }
+  const provider = String(selection?.provider ?? selection?.providerId ?? selection?.route?.provider ?? '').trim()
+  const model = String(selection?.model ?? selection?.modelId ?? selection?.route?.model ?? '').trim()
+  if (!provider || !model) return null
+  return { provider, model, reasoningEffort: selection?.reasoningEffort }
+}
+
+const AI_DRAFT_SYSTEM =
+  '你是 DeepSeek Harness 的「专家架构师」，负责把用户一句粗略描述完善成能立刻上岗的专家角色定义。' +
+  '你只输出一个 JSON 对象：不要解释、不要代码围栏、不要多余文字。描述里没写到的细节按专业判断补齐，不要反问用户、不要要求确认。'
+
+const AI_FLOW_STEPS = [
+  '定位与边界：属于哪条链路（前端 / 后端 / 数据 / 测试 / 评审 / 交付…）、和相邻角色怎么分工',
+  '能力清单：从擅长的技术栈与场景倒推 4-6 项可独立交付的能力',
+  '工作流程：按「读规范 → 理解需求 → 出方案 → 实现 → 自测 → 交付」写成固定动作',
+  '输出规范：交付物形态（代码 / 文档 / 单测 / 评审意见）与必须给出的证据',
+  '红线与自检：最容易出错的 3-5 个点，以及什么情况必须停下报告',
+  '触发场景：写清「什么时候该请他」，让调度的人一眼能判断',
+]
+
+/** 单个专家的 JSON 作业单。 */
+export function aiExpertPrompt({ description, id = '', displayName = '' }) {
+  const lines = [
+    '请按下面的专业流程，把用户这句粗略描述完善成一位能立刻上岗的专家，并以 JSON 返回。',
+    '',
+    '## 用户的原话（唯一输入）',
+    '"""',
+    String(description ?? '').trim(),
+    '"""',
+    '',
+    '## 内部专业流程（照这个想，不要把过程写进 JSON）',
+    ...AI_FLOW_STEPS.map((step, index) => `${index + 1}. ${step}`),
+    '',
+    '## 只输出这个 JSON 对象（字段全部必填，数组元素是字符串）',
+    '{',
+    `  "id": "${id || 'kebab-case 小写英文标识，例如 payment-reconcile-expert'}",`,
+    `  "displayName": "${displayName || '中文短名，2-4 字，如「老付」'}",`,
+    '  "profession": "职业定位，如「支付对账专家」",',
+    '  "description": "一句话：他负责什么、什么时候该请他",',
+    '  "abilities": ["4-6 条能独立交付的具体能力（不要空话）"],',
+    '  "flow": ["5-8 步他接到需求后的固定动作"],',
+    '  "outputs": ["3-5 条交付时给什么、必须附什么证据"],',
+    '  "cautions": ["3-5 条红线与必须停下报告的情况"],',
+    '  "assumptions": ["最多 5 条你替他做的假设"]',
+    '}',
+  ]
+  if (id || displayName) lines.push('', `用户已指定：${id ? `标识 \`${id}\`` : ''}${id && displayName ? '、' : ''}${displayName ? `显示名 \`${displayName}\`` : ''}，请直接采用。`)
+  return lines.join('\n')
+}
+
+/** 专家团的 JSON 作业单：一次把团长、成员分工和缺的成员定义都给全。 */
+export function aiTeamPrompt({ description, id = '', known = [] }) {
+  const lines = [
+    '请按下面的专业流程，把用户这句粗略描述完善成一个能立刻开工的专家团（团长 + 成员分工），并以 JSON 返回。',
+    '',
+    '## 用户的原话（唯一输入）',
+    '"""',
+    String(description ?? '').trim(),
+    '"""',
+    '',
+    '## 内部专业流程（照这个想，不要把过程写进 JSON）',
+    ...AI_FLOW_STEPS.map((step, index) => `${index + 1}. ${step}`),
+    '7. 团队编排：谁先动、谁拍板、谁验收，交接点交付什么',
+    '',
+    '## 只输出这个 JSON 对象（字段全部必填）',
+    '{',
+    `  "id": "${id || 'kebab-case 小写英文标识，例如 fullstack-delivery-team'}",`,
+    '  "name": "中文团名，如「全栈交付一条龙专家团」",',
+    '  "profession": "这个团整体干什么，如「需求 → 架构 → 开发 → 评审 → 测试 一条龙交付」",',
+    '  "description": "一句话：什么时候该请这个团",',
+    '  "lead": "members 里最该拍板那位的 id",',
+    '  "flow": ["3-6 条协作步骤（谁做什么、交接什么）"],',
+    '  "members": [',
+    '    {',
+    '      "id": "成员的 kebab-case 标识",',
+    '      "displayName": "中文短名 2-4 字",',
+    '      "profession": "职业定位",',
+    '      "description": "一句话：他负责什么、什么时候该请他",',
+    '      "abilities": ["4-6 条能独立交付的具体能力"],',
+    '      "flow": ["5-8 步固定动作"],',
+    '      "outputs": ["3-5 条交付物与证据"],',
+    '      "cautions": ["3-5 条红线"]',
+    '    }',
+    '  ],',
+    '  "assumptions": ["最多 5 条你替用户做的假设"]',
+    '}',
+    '',
+    'members 给 2-6 位（按描述里的角色拆，一个人能兼两件事就写一个更贴切的成员）。',
+    known.length ? `已经有这些专家，能复用就把他的 id 直接放进 members，不要重复造：${known.join('、')}` : '目前还没有已存在的专家。',
+  ]
+  return lines.join('\n')
+}
+
+/** 把模型返回的数组字段转成 createExpert 认的「一行一条」文本。 */
+function linesOf(value) {
+  if (Array.isArray(value)) return value.map((line) => String(line ?? '').trim()).filter(Boolean).join('\n')
+  return String(value ?? '')
+}
+
+/** 把模型这次回答的文本收集起来（只要 text-delta，遇到 error 收尾就记下来）。 */
+async function llmCollectText(llm, route, system, userText, signal) {
+  let text = ''
+  let failure = null
+  const stream = llm.stream({
+    provider: route.provider,
+    model: route.model,
+    reasoningEffort: route.reasoningEffort,
+    system,
+    messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+    maxTokens: 4000,
+    signal,
+  })
+  for await (const chunk of stream) {
+    if (chunk?.type === 'text-delta') text += String(chunk.text ?? '')
+    else if (chunk?.type === 'finish' && chunk.reason?.kind === 'error') failure = chunk.reason.failure
+    else if (chunk?.type === 'finish' && chunk.reason?.kind === 'aborted') failure = chunk.reason.failure ?? { message: '模型调用被中断' }
+  }
+  return { text, failure }
+}
+
+const AI_TIMEOUT_MS = 120000
+
+/**
+ * 页面里「AI 直接创建」：调宿主 llm 服务拿结构化草稿，再由工作台按标准格式落盘。
+ * 全程不经过对话、不需要复制任何提示词；失败一律返回 ok:false + 原因，由页面提示退路。
+ */
+async function aiCreateDraft(ctx, config, settings, body) {
+  const llm = typeof ctx?.get === 'function' ? ctx.get('llm') : undefined
+  if (!llm || typeof llm.stream !== 'function') {
+    return { ok: false, error: '这个宿主没提供「直接调模型」的能力，点「发到对话里做」即可' }
+  }
+  const route = resolveLlmRoute(ctx, settings)
+  if (!route) return { ok: false, error: '取不到当前默认模型，先在对话框里选一个模型再试' }
+  const kind = body?.kind === 'team' ? 'team' : 'expert'
+  const description = String(body?.description ?? '').trim()
+  if (!description) return { ok: false, error: '先用一句话说清你要谁（AI 靠它完善细节）' }
+  const scope = body?.scope === 'project' ? 'project' : 'harness'
+  const listing = await listExperts(config, settings)
+  const known = listing.experts.map((expert) => expert.agentId)
+  const userText = kind === 'team'
+    ? aiTeamPrompt({ description, id: String(body?.id ?? ''), known })
+    : aiExpertPrompt({ description, id: String(body?.id ?? ''), displayName: String(body?.displayName ?? '') })
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS)
+  let text = ''
+  let failure = null
+  try {
+    const result = await llmCollectText(llm, route, AI_DRAFT_SYSTEM, userText, controller.signal)
+    text = result.text
+    failure = result.failure
+  } catch (error) {
+    return { ok: false, error: `调模型失败：${String(error?.message ?? error)}` }
+  } finally {
+    clearTimeout(timer)
+  }
+  if (failure) return { ok: false, error: `模型报错：${String(failure.message ?? '未知错误')}` }
+  const draft = parseJsonLoose(text)
+  if (!draft) return { ok: false, error: '模型这次没给出可用的 JSON，可以点「发到对话里做」让它用文件工具落盘', raw: String(text).slice(0, 400) }
+
+  const created = []
+  if (kind === 'expert') {
+    const result = await createExpert(config, settings, {
+      id: String(body?.id ?? '') || draft.id,
+      name: draft.name,
+      displayName: String(body?.displayName ?? '') || draft.displayName,
+      profession: draft.profession,
+      description: draft.description || description,
+      abilities: linesOf(draft.abilities),
+      flow: linesOf(draft.flow),
+      outputs: linesOf(draft.outputs),
+      cautions: linesOf(draft.cautions),
+      scope,
+      overwrite: false,
+    })
+    if (!result.ok) return { ok: false, error: result.error, draft }
+    created.push(result)
+  } else {
+    const members = Array.isArray(draft.members) ? draft.members.slice(0, 8) : []
+    if (!members.length) return { ok: false, error: '模型没给出团队成员，重试或改用「发到对话里做」', draft }
+    const memberIds = []
+    for (const member of members) {
+      const memberId = slugifySkillName(member?.id || member?.agentId || member?.name)
+      if (!memberId) continue
+      memberIds.push(memberId)
+      if (known.includes(memberId)) continue
+      const result = await createExpert(config, settings, {
+        id: memberId,
+        displayName: member?.displayName,
+        profession: member?.profession,
+        description: member?.description || `${memberId}（由 AI 按专家团分工补齐）`,
+        abilities: linesOf(member?.abilities),
+        flow: linesOf(member?.flow),
+        outputs: linesOf(member?.outputs),
+        cautions: linesOf(member?.cautions),
+        scope,
+        overwrite: false,
+      })
+      if (result.ok) created.push(result)
+      else if (!result.exists) return { ok: false, error: `成员「${memberId}」没建成：${result.error}`, draft, created }
+    }
+    if (!memberIds.length) return { ok: false, error: '模型给出的成员标识都不可用，重试一次', draft }
+    const teamResult = await createTeam(config, settings, {
+      id: String(body?.id ?? '') || draft.id,
+      name: draft.name,
+      profession: draft.profession,
+      description: draft.description || description,
+      lead: draft.lead,
+      members: memberIds,
+      flow: linesOf(draft.flow),
+      scope,
+    })
+    if (!teamResult.ok) return { ok: false, error: teamResult.error, draft, created }
+    created.push(teamResult)
+  }
+  const last = created[created.length - 1]
+  return {
+    ok: true,
+    kind,
+    model: `${route.provider}/${route.model}`,
+    created,
+    id: String(last?.id ?? ''),
+    path: String(last?.path ?? ''),
+    name: kind === 'team' ? String(draft.name ?? last?.id ?? '') : String(draft.displayName ?? draft.name ?? last?.id ?? ''),
+    members: kind === 'team' ? (last?.members ?? []) : undefined,
+    assumptions: Array.isArray(draft.assumptions) ? draft.assumptions.map(String).slice(0, 5) : [],
+  }
+}
+
 /* -------------------------------------------------------------- HTTP 层 */
 
 function sendJson(res, status, payload) {
@@ -1870,6 +2134,14 @@ export function apply(ctx, config) {
         const settings = await readSettings(config)
         const body = await readBody(req)
         const result = await createTeam(config, settings, body)
+        return sendJson(res, result.ok ? 200 : 400, result)
+      }
+
+      // 页面里「AI 直接创建」：调宿主 llm 服务拿结构化草稿，再由工作台落盘，不经过对话。
+      if (route === '/ai/create' && req.method === 'POST') {
+        const settings = await readSettings(config)
+        const body = await readBody(req)
+        const result = await aiCreateDraft(ctx, config, settings, body)
         return sendJson(res, result.ok ? 200 : 400, result)
       }
 

@@ -9,10 +9,10 @@
  * 运行：node test/smoke.mjs
  */
 import { EventEmitter } from 'node:events'
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, alignMatrixColumns, buildBatchUpdatePayload, cellValueFor, matrixShape, normalizeRecord, parseBaseInput, parseLarkRecords, recordsFromMatrix, renderExpertMarkdown, renderSkillMarkdown, slugifySkillName } from '../dsh/index.js'
+import { apply, alignMatrixColumns, buildBatchUpdatePayload, cellValueFor, matrixShape, normalizeRecord, parseBaseInput, parseJsonLoose, parseLarkRecords, recordsFromMatrix, renderExpertMarkdown, renderSkillMarkdown, slugifySkillName } from '../dsh/index.js'
 
 const LARK = process.env.RDW_LARK_CLI || 'D:\\soft\\nodejs\\lark-cli.ps1'
 const BASE_TOKEN = process.env.RDW_TEST_BASE || 'I3YnbPQp6awaxWsC1FZc8v89nyc'
@@ -128,12 +128,32 @@ check('值矩阵：字段名数不匹配就不产出记录', recordsFromMatrix([
 console.log('\n[2] HTTP 层（真实 handler）')
 const root = await mkdtemp(join(tmpdir(), 'rdw-smoke-'))
 const routes = []
+// 宿主 llm 服务的桩：/ai/create（页面里直接创建）靠它拿结构化草稿。llmReplyText 由用例改写。
+let llmReplyText = ''
+let llmAvailable = true
+const llmCalls = []
 const ctx = {
   effect(fn) {
     const dispose = fn()
     return () => {
       if (typeof dispose === 'function') dispose()
     }
+  },
+  get(key) {
+    if (key === 'llm') {
+      if (!llmAvailable) return undefined
+      return {
+        stream(options) {
+          llmCalls.push(options)
+          return (async function* chunks() {
+            yield { type: 'text-delta', index: 0, text: llmReplyText }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          })()
+        },
+      }
+    }
+    if (key === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-v4.1-flash' }) }
+    return undefined
   },
   webServer: {
     register(route) {
@@ -1407,17 +1427,34 @@ const aiPanel = withInjectedState(
 )
 const aiText = collectText(aiPanel).join(' ')
 check(
-  '新建专家默认是「一句话描述 + 交给 AI 完善并创建」，不再逼你填技术字段',
-  aiText.includes('交给 AI 完善并创建') && aiText.includes('一句话就够') && !aiText.includes('职业/定位'),
+  '新建专家默认是「一句话描述 + 页面里直接创建」，不再逼你填技术字段',
+  aiText.includes('AI 直接创建') && aiText.includes('一句话就够') && !aiText.includes('职业/定位'),
   aiText.slice(0, 240),
 )
-check('面板写明：AI 不会反问你，会自己补齐并把假设写在文件末尾', aiText.includes('不会反问你') && aiText.includes('我的假设'))
+check(
+  '面板写明：页面里就完成、不用去外面复制提示词；AI 也不反问你',
+  aiText.includes('不需要去外面复制任何提示词') && aiText.includes('不会反问你') && aiText.includes('我的假设'),
+)
 check('面板写明落盘位置（通用/项目可切）', aiText.includes('落盘目录') && aiText.includes('C:\\h\\agents'))
-const aiCreateBtn = collectByType(aiPanel, 'button').find((node) => collectText(node).join(' ').includes('交给 AI 完善并创建'))
+
+// 首选路径：页面里直接创建（工作台自己调模型并落盘）
+const aiCreateNowBtn = collectByType(aiPanel, 'button').find((node) => collectText(node).join(' ').includes('AI 直接创建'))
+aiFetch.length = 0
+sessionSends.length = 0
+await aiCreateNowBtn?.props?.onClick?.()
+check(
+  '点「AI 直接创建」：工作台调 /ai/create（带用户那句话与作用域），不需要对话参与',
+  aiFetch.some((item) => item.url.includes('/ai/create') && item.body.includes('一个盯支付对账的后端专家') && item.body.includes('"kind":"expert"')),
+  aiFetch.map((item) => `${item.url} ${item.body.slice(0, 60)}`),
+)
+check('「AI 直接创建」这条路上不会去碰对话（不需要用户复制提示词）', sessionSends.length === 0, sessionSends.length)
+
+// 备选路径按钮仍在，并且走的是「发进当前对话」
+const aiCreateBtn = collectByType(aiPanel, 'button').find((node) => collectText(node).join(' ').includes('发到对话里做'))
 sessionSends.length = 0
 await aiCreateBtn?.props?.onClick?.()
 check(
-  '点「交给 AI 完善并创建」：养成指令真被发进当前对话（agent 模式开跑）',
+  '点「发到对话里做」：养成指令真被发进当前对话（agent 模式开跑）',
   sessionSends.length === 1 &&
     String(sessionSends[0].parts?.[0]?.text).includes('一个盯支付对账的后端专家') &&
     String(sessionSends[0].parts?.[0]?.text).includes('pay-recon-expert.md') &&
@@ -1425,6 +1462,28 @@ check(
   { sends: sessionSends.length, mode: sessionSends[0]?.mode },
 )
 check('发送前先问工作台「当前是哪个对话」', aiFetch.some((item) => item.url.includes('/composer/session')), aiFetch.map((item) => item.url))
+
+// 结果卡：创建成功后当页显示名字、路径、成员，并能直接「选它开工」
+const aiDonePanel = withInjectedState(
+  {
+    0: aiExpertData,
+    9: 'team',
+    10: { description: '要一个一条龙交付的团队', scope: 'harness' },
+    14: { ok: true, kind: 'team', id: 'one-stop-team', name: '全栈交付一条龙专家团', path: 'C:\\h\\experts\\teams.json', members: ['a', 'b', 'c', 'd'], created: [{}, {}, {}, {}, {}], model: 'deepseek/deepseek-v4.1-flash', assumptions: ['假设是 Java 栈'] },
+  },
+  () => renderComponent('ExpertsModule', aiProps, '新建专家团（已创建）'),
+)
+const aiDoneText = collectText(aiDonePanel).join(' ')
+check(
+  '创建完成后当页就给结果：名字、落盘路径、成员、模型、假设',
+  aiDoneText.includes('✓ 专家团已创建：全栈交付一条龙专家团') &&
+    aiDoneText.includes('C:\\h\\experts\\teams.json') &&
+    aiDoneText.includes('成员 4 位') &&
+    aiDoneText.includes('deepseek/deepseek-v4.1-flash') &&
+    aiDoneText.includes('假设是 Java 栈'),
+  aiDoneText.slice(0, 260),
+)
+check('结果卡上有「选它开工」，不用再去别的页面选', collectByType(aiDonePanel, 'button').some((node) => collectText(node).join(' ').includes('选它开工')))
 const aiTeamPanel = withInjectedState({ 0: aiExpertData, 9: 'team', 10: { description: '要一个一条龙交付的团队', scope: 'harness' } }, () =>
   renderComponent('ExpertsModule', aiProps, '新建专家团（交给 AI 完善）'),
 )
@@ -1439,7 +1498,7 @@ entryClipboard.length = 0
 const aiPanelNoService = withInjectedState({ 0: aiExpertData, 9: 'expert', 10: { description: '一个盯支付对账的后端专家', scope: 'harness' } }, () =>
   renderComponent('ExpertsModule', { state: { settings: {} }, expertData: aiExpertData, service: {} }, '新建专家（宿主没给会话服务）'),
 )
-const aiCreateBtnNoService = collectByType(aiPanelNoService, 'button').find((node) => collectText(node).join(' ').includes('交给 AI 完善并创建'))
+const aiCreateBtnNoService = collectByType(aiPanelNoService, 'button').find((node) => collectText(node).join(' ').includes('发到对话里做'))
 await aiCreateBtnNoService?.props?.onClick?.()
 check(
   '发不出去（宿主没给会话服务）时复制养成指令兜底，结果不丢',
@@ -1470,6 +1529,105 @@ check(
   expertsWithTeamFiles.status === 200 && Array.isArray(expertsWithTeamFiles.json?.teamFiles) && expertsWithTeamFiles.json.teamFiles.every((file) => typeof file.path === 'string' && file.path),
   expertsWithTeamFiles.json?.teamFiles,
 )
+
+console.log('\n[6h] 页面里「AI 直接创建」：工作台自己调模型并落盘（不经过对话）')
+check(
+  '模型把 JSON 包在代码围栏里也能解析',
+  parseJsonLoose('```json\n{"id":"pay-expert","abilities":["a"]}\n```')?.id === 'pay-expert',
+  parseJsonLoose('```json\n{"id":"pay-expert"}\n```'),
+)
+check(
+  '模型在 JSON 前后加了解释文字也能解析（截取最外层大括号）',
+  parseJsonLoose('好的，这是结果：\n{"id":"x","flow":["1","2"]}\n希望有帮助')?.flow?.length === 2,
+  parseJsonLoose('好的，这是结果：{"id":"x"}'),
+)
+check('解析不出 JSON 时老实返回 null（不假装成功）', parseJsonLoose('抱歉，我没法完成') === null && parseJsonLoose('') === null && parseJsonLoose('[1,2]') === null)
+
+// 专家：模型返回草稿 → 工作台按标准格式落盘
+llmReplyText = JSON.stringify({
+  id: 'recon-expert',
+  displayName: '老付',
+  profession: '支付对账专家',
+  description: '盯支付对账，负责差异排查与批量修复',
+  abilities: ['对账差异定位', '批量修复脚本'],
+  flow: ['读对账规则', '拉差异明细', '出修复方案'],
+  outputs: ['差异清单', '修复脚本与验证结果'],
+  cautions: ['不擅自改对账规则'],
+  assumptions: ['假设使用 MySQL'],
+})
+llmCalls.length = 0
+const aiExpert = await call('POST', '/ai/create', { kind: 'expert', description: '一个盯支付对账的后端专家', scope: 'project' })
+check(
+  '/ai/create（专家）：页面里直接建成文件，返回路径与名字',
+  aiExpert.status === 200 && aiExpert.json?.ok === true && aiExpert.json.id === 'recon-expert' && String(aiExpert.json.path).includes('recon-expert.md'),
+  { status: aiExpert.status, body: aiExpert.json },
+)
+const expertFileText = String(await readFile(aiExpert.json.path, 'utf8'))
+check(
+  '落盘的专家文件是标准格式（frontmatter + 四段），工具自己也能读',
+  expertFileText.includes('displayName: 老付') &&
+    expertFileText.includes('profession: 支付对账专家') &&
+    ['## 核心能力', '## 工作流程', '## 输出规范', '## 注意事项'].every((part) => expertFileText.includes(part)),
+  expertFileText.slice(0, 140),
+)
+check(
+  'AI 的假设只回给页面看，不写进角色定义正文',
+  !expertFileText.includes('假设使用 MySQL') && aiExpert.json.assumptions?.[0] === '假设使用 MySQL',
+  aiExpert.json.assumptions,
+)
+check(
+  '调模型用的是宿主默认模型路由，且把用户那句话带上了',
+  llmCalls.length === 1 && llmCalls[0].provider === 'deepseek' && llmCalls[0].model === 'deepseek-v4.1-flash' && String(llmCalls[0].messages?.[0]?.content?.[0]?.text).includes('一个盯支付对账的后端专家'),
+  { provider: llmCalls[0]?.provider, model: llmCalls[0]?.model },
+)
+
+// 专家团：成员一并补齐 + 条目写进清单文件
+llmReplyText = JSON.stringify({
+  id: 'one-stop-team',
+  name: '全栈交付一条龙专家团',
+  profession: '需求 → 架构 → 开发 → 评审 → 测试 一条龙',
+  description: '要交付一个功能时请他们',
+  lead: 'team-architect',
+  flow: ['先定需求', '再定方案', '实现后评审', '测试出结论'],
+  members: [
+    { id: 'team-architect', displayName: '老构', profession: '架构师', description: '定方案并实现', abilities: ['方案设计'], flow: ['出方案'], outputs: ['改动清单'], cautions: ['不越界改需求'] },
+    { id: 'team-reviewer', displayName: '老审', profession: '评审', description: '独立评审', abilities: ['问题定位'], flow: ['看改动'], outputs: ['问题清单'], cautions: ['只评不改'] },
+  ],
+  assumptions: ['假设是 Java 技术栈'],
+})
+llmCalls.length = 0
+const aiTeam = await call('POST', '/ai/create', { kind: 'team', description: '要一个从需求到测试一条龙的团队', scope: 'project' })
+check(
+  '/ai/create（专家团）：一次把团与成员都建好',
+  aiTeam.status === 200 && aiTeam.json?.ok === true && aiTeam.json.id === 'one-stop-team' && (aiTeam.json.members ?? []).length === 2 && (aiTeam.json.created ?? []).length === 3,
+  { status: aiTeam.status, created: (aiTeam.json?.created ?? []).map((item) => item.id), members: aiTeam.json?.members },
+)
+const teamListAfterAi = await call('GET', '/experts')
+check(
+  '新建的专家团立刻出现在专家列表里（页面刷新就能选）',
+  (teamListAfterAi.json?.teams ?? []).some((team) => team.id === 'one-stop-team' && team.lead === 'team-architect'),
+  (teamListAfterAi.json?.teams ?? []).map((team) => `${team.id}:${team.lead}`),
+)
+
+// 再次创建同一个团 → 覆盖前必须拦住（不静默覆盖）
+llmCalls.length = 0
+const aiTeamAgain = await call('POST', '/ai/create', { kind: 'team', description: '同样一个团', scope: 'project' })
+check(
+  '重复创建会被拦住并说明原因（不静默覆盖）',
+  aiTeamAgain.status === 400 && aiTeamAgain.json?.ok === false && String(aiTeamAgain.json.error).includes('已存在'),
+  aiTeamAgain.json,
+)
+
+// 各种失败路径：都要 ok:false + 人话原因
+llmAvailable = false
+const aiNoLlm = await call('POST', '/ai/create', { kind: 'expert', description: '随便一个专家', scope: 'project' })
+llmAvailable = true
+check('宿主没给 llm 服务时：如实说没这个能力，并指路备选', aiNoLlm.status === 400 && String(aiNoLlm.json?.error).includes('发到对话里做'), aiNoLlm.json)
+llmReplyText = '我觉得这个需求是这样的……（没有 JSON）'
+const aiBadJson = await call('POST', '/ai/create', { kind: 'expert', description: '随便一个专家', scope: 'project' })
+check('模型没给 JSON 时：不落盘、返回原因并留原文片段，还指了退路', aiBadJson.status === 400 && String(aiBadJson.json?.error).includes('JSON') && String(aiBadJson.json?.error).includes('发到对话里做') && typeof aiBadJson.json?.raw === 'string', aiBadJson.json)
+const aiNoDescription = await call('POST', '/ai/create', { kind: 'expert', description: '', scope: 'project' })
+check('没写描述时不凭空造：要求先给一句话', aiNoDescription.status === 400 && String(aiNoDescription.json?.error).includes('一句话'), aiNoDescription.json)
 
 console.log('\n[7] 多张飞书表：清单 / 表结构 / 跨表总览')
 await writeFile(
