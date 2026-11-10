@@ -2,3 +2,5 @@ node_modules/
 *.tgz
 *.log
 .DS_Store
+# 本机私有：真实飞书表信息，不提交
+test/smoke.local.json

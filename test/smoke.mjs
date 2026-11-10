@@ -12,15 +12,25 @@ import { EventEmitter } from 'node:events'
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, alignMatrixColumns, buildBatchUpdatePayload, cellValueFor, matrixShape, normalizeRecord, parseBaseInput, parseJsonLoose, parseLarkRecords, recordsFromMatrix, renderExpertMarkdown, renderSkillMarkdown, slugifySkillName } from '../dsh/index.js'
+import { readFileSync } from 'node:fs'
+import { FLOW_EVIDENCE_KINDS, FLOW_STAGES, FLOW_STATUS, apply, alignMatrixColumns, buildBatchUpdatePayload, cellValueFor, checkAcceptanceCriteria, flowEvidenceStats, flowPercent, flowStageName, foldFlows, foldRuns, listTables, matrixShape, normalizeRecord, parseBaseInput, parseChangelog, parseDocInput, parseDocPayload, parseJsonLoose, parseLarkRecords, recordsFromMatrix, renderExpertMarkdown, renderSkillMarkdown, runTaskKey, slugifySkillName } from '../dsh/index.js'
 
-const LARK = process.env.RDW_LARK_CLI || 'D:\\soft\\nodejs\\lark-cli.ps1'
-const BASE_TOKEN = process.env.RDW_TEST_BASE || 'I3YnbPQp6awaxWsC1FZc8v89nyc'
-const TABLE_ID = process.env.RDW_TEST_TABLE || '知识目录'
+// 真实飞书表信息不写进仓库：优先读环境变量，其次读本机私有配置 test/smoke.local.json（已在 .gitignore 里）。
+// 都没有时用占位值 —— 真实网络相关的检查会降级为 WARN，不会判失败。
+const localTestConfig = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('./smoke.local.json', import.meta.url), 'utf8'))
+  } catch {
+    return {}
+  }
+})()
+const LARK = process.env.RDW_LARK_CLI || localTestConfig.larkCli || 'lark-cli'
+const BASE_TOKEN = process.env.RDW_TEST_BASE || localTestConfig.baseToken || 'bascnPlaceholderToken'
+const TABLE_ID = process.env.RDW_TEST_TABLE || localTestConfig.tableId || '需求池'
 const REAL_BASE_URL =
-  process.env.RDW_TEST_REAL_BASE || 'https://gaiaworks.feishu.cn/base/C61gbfm4fa5DIIs1tuVc93KHnoe?table=tbl4rWKwWr1tL1io'
+  process.env.RDW_TEST_REAL_BASE || localTestConfig.realBaseUrl || 'https://example.feishu.cn/base/placeholderBaseToken0001?table=tblPlaceholder0001'
 const REAL_TASK_URL =
-  process.env.RDW_TEST_TASK_BASE || 'https://gaiaworks.feishu.cn/base/C61gbfm4fa5DIIs1tuVc93KHnoe?table=tbluJCHiLRNUpTYl'
+  process.env.RDW_TEST_TASK_BASE || localTestConfig.realTaskUrl || 'https://example.feishu.cn/base/placeholderBaseToken0001?table=tblPlaceholder0002'
 
 let passed = 0
 let warned = 0
@@ -45,12 +55,12 @@ function warn(name, extra) {
 
 console.log('\n[1] 纯函数')
 check('链接解析：base + table', (() => {
-  const parsed = parseBaseInput('https://abc.feishu.cn/base/I3YnbPQp6awaxWsC1FZc8v89nyc?table=tblAbC123&view=vew1')
-  return parsed.baseToken === 'I3YnbPQp6awaxWsC1FZc8v89nyc' && parsed.tableId === 'tblAbC123'
+  const parsed = parseBaseInput('https://abc.feishu.cn/base/bascnPlaceholderToken?table=tblAbC123&view=vew1')
+  return parsed.baseToken === 'bascnPlaceholderToken' && parsed.tableId === 'tblAbC123'
 })())
 check('链接解析：裸 token', (() => {
-  const parsed = parseBaseInput('I3YnbPQp6awaxWsC1FZc8v89nyc 知识目录')
-  return parsed.baseToken === 'I3YnbPQp6awaxWsC1FZc8v89nyc' && parsed.tableId === '知识目录'
+  const parsed = parseBaseInput('bascnPlaceholderToken 知识目录')
+  return parsed.baseToken === 'bascnPlaceholderToken' && parsed.tableId === '知识目录'
 })())
 check('链接解析：空输入', parseBaseInput('').baseToken === '')
 
@@ -260,6 +270,19 @@ await (async () => {
   await mkdir(join(projectDir, 'doc', 'standards'), { recursive: true })
   await writeFile(join(projectDir, 'doc', 'standards', '03-coding.md'), '# 编码规范\n', 'utf8')
   await writeFile(join(projectDir, 'AGENTS.md'), '# 项目约定\n', 'utf8')
+  // v4.2：模拟「开发 skill 在流程里产出的 spec 文档」——工作台只认不造
+  await mkdir(join(projectDir, 'specs'), { recursive: true })
+  await writeFile(join(projectDir, 'specs', 'cursor-paging.spec.md'), [
+    '# 分页游标',
+    '',
+    '## 验收标准',
+    '',
+    '- 当游标过期时，接口返回 410 并提示「游标已失效」',
+    '- 分页要正常工作',
+    '',
+    '## 非目标',
+    '- 不做前端改造',
+  ].join('\n'), 'utf8')
 })()
 await call('POST', '/settings', { projectDir })
 const scanned = await call('GET', '/skills')
@@ -512,9 +535,9 @@ await writeFile(
   JSON.stringify(
     {
       version: 1,
-      defaultSource: 'dahua-skill-service',
+      defaultSource: 'demo-project',
       sources: {
-        'dahua-skill-service': {
+        'demo-project': {
           baseUrl: REAL_BASE_URL,
           tableName: '需求池',
           identity: 'user',
@@ -540,7 +563,7 @@ await writeFile(
 )
 
 const detected = await call('GET', '/sources')
-check('认出项目里的需求源配置', detected.status === 200 && detected.json?.found === true && detected.json.sources?.[0]?.name === 'dahua-skill-service', detected.json?.path)
+check('认出项目里的需求源配置', detected.status === 200 && detected.json?.found === true && detected.json.sources?.[0]?.name === 'demo-project', detected.json?.path)
 
 const stateWithSource = await call('GET', '/state')
 check('/state 因为需求源存在而视为已配置', stateWithSource.json?.configured === true && stateWithSource.json?.source?.configPath?.endsWith('.requirement-sources.json'))
@@ -662,7 +685,7 @@ const sampleItem = {
   fields: { 状态: '待开发', 需求标题: '技能标签支持 Excel 批量导入', 原始需求: '优化导入性能', 优先级: 'P0' },
   fieldNames: ['状态', '需求标题', '原始需求', '优先级'],
 }
-const sampleTable = { key: 'requirement:dahua-skill-service', label: '开发需求 · dahua-skill-service', tableName: '需求池', kind: 'requirement', configPath: 'D:\\p\\.requirement-sources.json', fieldMap: null }
+const sampleTable = { key: 'requirement:demo-project', label: '开发需求 · demo-project', tableName: '需求池', kind: 'requirement', configPath: 'D:\\workspace\\demo-project\\.requirement-sources.json', fieldMap: null }
 const sampleView = pure.sliceForTable ? pure.sliceForTable({ modules: [], tables: {} }, sampleTable.key) : {}
 const sampleSchema = [
   { name: '状态', options: ['待开发', '已完成'] },
@@ -688,7 +711,7 @@ const renderComponent = (name, props, label) => {
 }
 
 const tableNode = renderComponent('TableModule', {
-  state: { configured: true, settings: { projectDir: 'D:\\workspace\\dahua-skill\\dahua-skill-service' }, larkCli: 'lark-cli.cmd' },
+  state: { configured: true, settings: { projectDir: 'D:\\workspace\\demo-project' }, larkCli: 'lark-cli.cmd' },
   reloadState: () => {},
   uiWorkspace: {},
   table: sampleTable,
@@ -713,12 +736,12 @@ renderComponent('OverviewModule', {
     ],
   },
   loading: false,
-  runs: [{ id: 'run1', at: '2026-10-22T10:00:00.000Z', title: sampleItem.title, status: 'handed-off', tableKey: sampleTable.key, projectDir: 'D:\\workspace\\dahua-skill\\dahua-skill-service', note: '已复制开发指令' }],
+  runs: [{ id: 'run1', at: '2026-10-22T10:00:00.000Z', title: sampleItem.title, status: 'handed-off', tableKey: sampleTable.key, projectDir: 'D:\\workspace\\demo-project', note: '已复制开发指令' }],
   onRefresh: () => {},
   onOpenTable: () => {},
   onUpdateRun: () => {},
   onAddModule: () => {},
-  projectDir: 'D:\\workspace\\dahua-skill\\dahua-skill-service',
+  projectDir: 'D:\\workspace\\demo-project',
 })
 renderComponent('ModuleDialog', {
   tables: [sampleTable],
@@ -780,10 +803,10 @@ const collectByType = (node, type, out = []) => {
 }
 
 const secondItem = { ...sampleItem, id: 'rec2', title: '薪资标准对比导出', status: '已完成', fields: { ...sampleItem.fields, 状态: '已完成', 需求标题: '薪资标准对比导出' } }
-const tableData = { configured: true, items: [sampleItem, secondItem], count: 2, source: { label: '开发需求 · dahua-skill-service', tableName: '需求池', configPath: 'x' } }
+const tableData = { configured: true, items: [sampleItem, secondItem], count: 2, source: { label: '开发需求 · demo-project', tableName: '需求池', configPath: 'x' } }
 const schemaResult = { configured: true, fields: sampleSchema }
 const tableProps = {
-  state: { configured: true, settings: { projectDir: 'D:\\workspace\\dahua-skill\\dahua-skill-service' }, larkCli: 'lark-cli.cmd' },
+  state: { configured: true, settings: { projectDir: 'D:\\workspace\\demo-project' }, larkCli: 'lark-cli.cmd' },
   reloadState: () => {},
   uiWorkspace: {},
   table: sampleTable,
@@ -836,16 +859,296 @@ check('进度视图给出百分比与分桶', progressText.includes('50%') && pr
 
 const detailNode = withInjectedState({ 0: tableData, 1: schemaResult, 5: 'rec1' }, () => renderComponent('TableModule', tableProps, 'TableModule（选中一条·详情）'))
 check('选中一条会渲染详情组件', collectByType(detailNode, components.DetailView).length === 1 && collectByType(detailNode, components.DetailView)[0].props.item.id === 'rec1')
-check('详情是弹窗（遮罩 + role=dialog），带执行记录角标', (() => {
+check('详情不再是弹窗（没有遮罩、没有 role=dialog），改成右侧分栏', (() => {
   const masks = collectByType(detailNode, 'div').filter((entry) => String(entry.props?.className ?? '') === 'rdw-mask')
   const modals = collectByType(detailNode, 'div').filter((entry) => String(entry.props?.className ?? '') === 'rdw-modal')
-  return masks.length === 1 && modals.length === 1 && modals[0].props.role === 'dialog' && modals[0].props['aria-modal'] === 'true' && collectText(modals[0]).join(' ').includes('已交付')
+  return masks.length === 0 && modals.length === 0
 })())
+const detailPane = collectByType(detailNode, 'div').find((entry) => String(entry.props?.className ?? '').includes('rdw-col-detail'))
+check('详情挂在右侧分栏上，宽度落在样式变量里（默认 420px）', String(detailPane?.props?.style?.['--rdw-detail-w'] ?? '') === '420px', detailPane?.props?.style)
+check('详情栏顶部保留执行记录角标（已交付）', collectText(detailPane ?? detailNode).join(' ').includes('已交付'))
+const detailCollapse = collectByType(detailPane ?? detailNode, 'button').find((entry) => collectText(entry).join('') === '收起')
+check('详情栏可单独收起（「收起」按钮，选中的记录不丢，点一下只收这一栏）', Boolean(detailCollapse) && typeof detailCollapse.props?.onClick === 'function', detailCollapse?.props?.title)
+check('详情栏另有「关闭」= 取消选中（和「收起」区分开，不会误清选中）', collectByType(detailPane ?? detailNode, 'button').some((entry) => collectText(entry).join('') === '关闭'))
+const paneResizer = collectByType(detailNode, 'div').find((entry) => String(entry.props?.className ?? '').includes('rdw-pane-resizer'))
+check(
+  '详情栏可拖拽调宽（分隔条 role=separator + 鼠标拖 / 双击复位 / 方向键三套交互）',
+  Boolean(paneResizer) &&
+    paneResizer.props?.role === 'separator' &&
+    paneResizer.props?.['aria-orientation'] === 'vertical' &&
+    typeof paneResizer.props?.onMouseDown === 'function' &&
+    typeof paneResizer.props?.onDoubleClick === 'function' &&
+    typeof paneResizer.props?.onKeyDown === 'function',
+  paneResizer?.props?.className,
+)
+check(
+  '纯函数：详情栏宽度夹在 300~760（默认 420；容器没量到时按 980 兜底）',
+  pure.clampDetailWidth?.(0) === 420 && pure.clampDetailWidth?.(100) === 300 && pure.clampDetailWidth?.(9999) === 760 && pure.clampDetailWidth?.(520.5) === 521,
+  [pure.clampDetailWidth?.(0), pure.clampDetailWidth?.(100), pure.clampDetailWidth?.(9999), pure.clampDetailWidth?.(520.5)],
+)
+check(
+  '纯函数：ISO 时间串展示成 yyyy-MM-dd HH:mm:ss（不再露出 T 与 +08:00）',
+  pure.formatCellValue?.('2026-10-10T13:05:09') === '2026-10-10 13:05:09' &&
+    /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(String(pure.formatCellValue?.('2026-10-10T00:00:00.000+08:00'))) &&
+    !String(pure.formatCellValue?.('2026-10-10T00:00:00.000+08:00')).includes('T') &&
+    pure.formatCellValue?.('PR-20261008-0001') === 'PR-20261008-0001' &&
+    pure.formatCellValue?.('2026-10-10') === '2026-10-10' &&
+    pure.formatCellValue?.('') === '' &&
+    pure.formatCellValue?.(null) === '',
+  [pure.formatCellValue?.('2026-10-10T13:05:09'), pure.formatCellValue?.('2026-10-10T00:00:00.000+08:00'), pure.formatCellValue?.('PR-20261008-0001')],
+)
+check(
+  '纯函数：并排时按内容区自适应夹宽（列表最少留 120~220、详情最少占 45%）',
+  pure.clampDetailWidth?.(9999, 900) === 680 &&
+    pure.clampDetailWidth?.(420, 900) === 420 &&
+    pure.clampDetailWidth?.(9999, 1400) === 760 &&
+    pure.clampDetailWidth?.(420, 720) === 420,
+  [pure.clampDetailWidth?.(9999, 900), pure.clampDetailWidth?.(420, 900), pure.clampDetailWidth?.(9999, 1400), pure.clampDetailWidth?.(420, 720)],
+)
+// 这条是用户报的那个 bug：内容区 520~560 时旧的夹法把宽度钉死，拖了没反应
+check(
+  '纯函数：内容区只有 540 / 520 / 460 时也拖得动（可调范围 ≥ 120px，不再钉死在最小值）',
+  pure.clampDetailWidth?.(9999, 540) - pure.clampDetailWidth?.(1, 540) >= 150 &&
+    pure.clampDetailWidth?.(9999, 520) - pure.clampDetailWidth?.(1, 520) >= 120 &&
+    pure.clampDetailWidth?.(9999, 460) - pure.clampDetailWidth?.(1, 460) >= 100,
+  [pure.clampDetailWidth?.(1, 540), pure.clampDetailWidth?.(9999, 540), pure.clampDetailWidth?.(1, 520), pure.clampDetailWidth?.(9999, 520), pure.clampDetailWidth?.(1, 460), pure.clampDetailWidth?.(9999, 460)],
+)
+check(
+  '纯函数：上下排时的高度也留出可调范围（600 高 → 140~400，不再钉死）',
+  pure.clampDetailHeight?.(0) === 280 &&
+    pure.clampDetailHeight?.(100) === 140 &&
+    pure.clampDetailHeight?.(9999) === 720 &&
+    pure.clampDetailHeight?.(9999, 600) === 400 &&
+    pure.clampDetailHeight?.(9999, 600) - pure.clampDetailHeight?.(1, 600) >= 120,
+  [pure.clampDetailHeight?.(0), pure.clampDetailHeight?.(100), pure.clampDetailHeight?.(9999, 600), pure.clampDetailHeight?.(1, 600)],
+)
+check(
+  '不再按宽度自动占满（自动占满会把拖拽条一起藏掉，这正是「拖不动」的原因之一）',
+  typeof pure.isDetailFull === 'undefined' && clientSource.includes("${detailFull ? ' is-detail-full' : ''}"),
+  typeof pure.isDetailFull,
+)
+check(
+  '窄窗口不再自动上下排（自动上下排 = 详情占满整宽，宽度根本没法调）—— 改成显式 is-stacked',
+  !clientSource.includes('.rdw-narrow .rdw-split{flex-direction:column}') &&
+    !clientSource.includes('.rdw-narrow .rdw-col-detail.is-sized') &&
+    !clientSource.includes('.rdw-narrow .rdw-col-list{flex:0 0 auto') &&
+    clientSource.includes('.rdw-split.is-stacked{flex-direction:column}') &&
+    clientSource.includes("${detailStacked ? ' is-stacked' : ''}"),
+)
+check(
+  '无详情时汇总清单列表默认伸展占满内容区',
+  clientSource.includes('.rdw-col-list{flex:1 1 auto;min-width:0;') && clientSource.includes('.rdw-split.has-detail .rdw-col-list{flex:1 1 auto}'),
+)
+check(
+  '样式：竖杠常显细线 + 收起后列表整宽 + 上下排时换成横杠（拖高度）+ 占满时列表让位',
+  [
+    '.rdw-pane-resizer{flex:0 0 16px',
+    '.rdw-pane-resizer::after{content:\'\';position:absolute;inset:0 6px',
+    '.rdw-split.has-detail .rdw-col-detail.is-sized{max-width:calc(100% - 120px)}',
+    '.rdw-pane-resizer-v{display:none;flex:0 0 10px',
+    '.rdw-split.is-stacked .rdw-pane-resizer{display:none}',
+    '.rdw-split.is-stacked .rdw-pane-resizer-v{display:block}',
+    '.rdw-split.is-stacked .rdw-col-detail.is-sized{flex:0 0 var(--rdw-detail-h,280px)',
+    '.rdw-split.is-detail-collapsed .rdw-col-list{flex:1 1 100%}',
+    '.rdw-split.is-detail-full .rdw-col-list{display:none}',
+    '.rdw-col-detail.is-sized{flex:0 0 var(--rdw-detail-w,420px)',
+  ].every((rule) => clientSource.includes(rule)),
+)
+
+/* --------- 拖拽会话（宽度/高度共用）：按下→移动→松开，纯逻辑自测 --------- */
+
+function fakeEventSource() {
+  const handlers = new Map()
+  return {
+    addEventListener: (type, fn) => handlers.set(`${type}:${fn.name || 'anon'}`, { type, fn }),
+    removeEventListener: (type, fn) => handlers.delete(`${type}:${fn.name || 'anon'}`),
+    emit: (type, event) => {
+      for (const { type: t, fn } of [...handlers.values()]) if (t === type) fn({ type, ...event })
+    },
+    count: () => handlers.size,
+  }
+}
+
+const dragApplied = []
+const dragCommitted = []
+const dragSource = fakeEventSource()
+const fakeTarget = { captured: 0, released: 0, setPointerCapture() { this.captured += 1 }, releasePointerCapture() { this.released += 1 } }
+const session = pure.createDragSession?.({
+  axis: 'x',
+  sign: -1,
+  startCoord: 300,
+  startValue: 200,
+  clamp: (value) => pure.clampDetailWidth(value, 400),
+  apply: (value) => dragApplied.push(value),
+  commit: (value) => dragCommitted.push(value),
+  source: dragSource,
+  target: fakeTarget,
+  pointerId: 7,
+})
+check(
+  '拖拽会话：挂上 window 捕获监听 + 抓住指针（宿主吞事件也能收到）+ 按下即生效',
+  dragSource.count() >= 5 && fakeTarget.captured === 1 && dragApplied[0] === 200,
+  { listeners: dragSource.count(), captured: fakeTarget.captured, applied: dragApplied },
+)
+dragSource.emit('mousemove', { clientX: 260 })
+check('向左拖 40px → 详情宽 240（方向对、实时生效）', dragApplied[dragApplied.length - 1] === 240, dragApplied)
+dragSource.emit('pointermove', { clientX: 100 })
+check('往左拖过头撞上限 280（内容区 400 时详情最多 280），不会拖飞', dragApplied[dragApplied.length - 1] === 280, dragApplied)
+dragSource.emit('mousemove', { clientX: 500 })
+check(
+  '拖到算出来正好是 0 时落到最小宽度（0 在配置语义里是「没配过」，直接用会跳到最宽 —— 这就是拖动会跳的根因）',
+  dragApplied[dragApplied.length - 1] === pure.clampDetailWidth(1, 400) && pure.clampDetailWidth(1, 400) < pure.clampDetailWidth(99999, 400),
+  { applied: dragApplied, min: pure.clampDetailWidth(1, 400), max: pure.clampDetailWidth(99999, 400) },
+)
+dragSource.emit('mousemove', { clientX: 600 })
+check('往右拖过头撞下限 126（列表还要留 120），两头都被夹住', dragApplied[dragApplied.length - 1] === 126, dragApplied)
+dragSource.emit('mouseup', {})
+check(
+  '松手只提交一次 + 释放指针 + 解绑监听（不残留会话）',
+  dragCommitted.length === 1 && dragCommitted[0] === 126 && fakeTarget.released === 1 && !session?.isActive() && dragSource.count() === 0,
+  { committed: dragCommitted, released: fakeTarget.released, active: session?.isActive(), listeners: dragSource.count() },
+)
+const before = dragCommitted.length
+dragSource.emit('mousemove', { clientX: 50 })
+session?.finish()
+check('会话结束后再来的事件一律忽略（不会重复提交）', dragCommitted.length === before, dragCommitted)
+const dragApplied2 = []
+const dragCommitted2 = []
+const session2 = pure.createDragSession?.({
+  axis: 'y',
+  sign: 1,
+  startCoord: 100,
+  startValue: 280,
+  clamp: (value) => pure.clampDetailHeight(value, 800),
+  apply: (value) => dragApplied2.push(value),
+  commit: (value) => dragCommitted2.push(value),
+  source: fakeEventSource(),
+  target: fakeTarget,
+  pointerId: 9,
+})
+session2?.move({ type: 'mousemove', clientY: 160 })
+session2?.finish()
+check('上下排同理：向下拖 60px → 详情高 340 并提交', dragCommitted2[0] === 340, { applied: dragApplied2, committed: dragCommitted2 })
+
+/* --------- 收起详情栏：只收这一栏，选中的记录留着，能一键展开 --------- */
+
+const detailCollapseStates = []
+const detailCollapsedProps = { ...tableProps, saveView: (patch) => detailCollapseStates.push(patch) }
+const detailCollapsedNode = withInjectedState({ 0: tableData, 1: schemaResult, 5: 'rec1', 19: true }, () => renderComponent('TableModule', { ...detailCollapsedProps, view: { ...(detailCollapsedProps.view ?? {}), detailCollapsed: true } }, 'TableModule（详情已收起）'))
+const detailCollapsedText = collectText(detailCollapsedNode).join(' ')
+check(
+  '收起后：详情栏不再渲染、列表占满、记录仍选中（那一行还是选中态）',
+  collectByType(detailCollapsedNode, 'div').every((entry) => !String(entry.props?.className ?? '').includes('rdw-col-detail')) &&
+    collectByType(detailCollapsedNode, 'div').some((entry) => String(entry.props?.className ?? '').includes('is-detail-collapsed')) &&
+    collectByType(detailCollapsedNode, 'tr').some((entry) => String(entry.props?.className ?? '').includes('is-selected')),
+  detailCollapsedText.slice(0, 200),
+)
+check(
+  '收起后页头有「展开详情 · <标题>」一键回来（不用重新点记录）',
+  collectByType(detailCollapsedNode, 'button').some((entry) => collectText(entry).join('').includes('展开详情') && String(entry.props?.title ?? '').includes('展开记录详情栏')),
+  collectByType(detailCollapsedNode, 'button').map((entry) => collectText(entry).join('')),
+)
+const detailExpandBtn = collectByType(detailCollapsedNode, 'button').find((entry) => collectText(entry).join('').includes('展开详情'))
+detailExpandBtn?.props?.onClick?.()
+check('点「展开详情」把收起状态写回本表配置（重启后也记得）', detailCollapseStates.some((patch) => patch.detailCollapsed === false), detailCollapseStates)
+check('收起时不渲染分隔条（没有可拖的东西）', collectByType(detailCollapsedNode, 'div').every((entry) => !String(entry.props?.className ?? '').includes('rdw-pane-resizer')))
+
+const detailCollapseSaveStates = []
+const detailCollapseNode = withInjectedState({ 0: tableData, 1: schemaResult, 5: 'rec1' }, () => renderComponent('TableModule', { ...tableProps, saveView: (patch) => detailCollapseSaveStates.push(patch) }, 'TableModule（点收起）'))
+const detailCollapseBtn = collectByType(detailCollapseNode, 'button').find((entry) => collectText(entry).join('') === '收起')
+detailCollapseBtn?.props?.onClick?.()
+check('点「收起」把 detailCollapsed=true 写回本表配置，且没有取消选中', detailCollapseSaveStates.some((patch) => patch.detailCollapsed === true), detailCollapseSaveStates)
+check('收起是「单独」的：不碰工作台/对话，也没有 leave() 之类的联动', !clientSource.includes("detailCollapsed') && leave") && clientSource.includes('只收起详情栏（选中的记录留着'))
+
+/* --------- 两种拖拽条（并排拖宽度 / 堆叠拖高度）+ 显式「占满」 --------- */
+
+check(
+  '并排时同时挂着竖杠和横杠（竖杠拖宽度、横杠拖高度；窄窗口由 CSS 换成横杠）',
+  Boolean(paneResizer) &&
+    collectByType(detailNode, 'div').find((entry) => String(entry.props?.className ?? '').includes('rdw-pane-resizer-v'))?.props?.['aria-orientation'] === 'horizontal' &&
+    collectByType(detailNode, 'div').find((entry) => String(entry.props?.className ?? '').includes('rdw-pane-resizer-v'))?.props?.role === 'separator',
+  collectByType(detailNode, 'div').filter((entry) => String(entry.props?.className ?? '').includes('rdw-pane-resizer')).map((entry) => entry.props?.['aria-orientation']),
+)
+const heightBar = collectByType(detailNode, 'div').find((entry) => String(entry.props?.className ?? '').includes('rdw-pane-resizer-v'))
+check(
+  '横杠三套交互齐全（拖 / 双击复位 / 上下方向键）且提示里带当前高度',
+  typeof heightBar?.props?.onMouseDown === 'function' &&
+    typeof heightBar?.props?.onDoubleClick === 'function' &&
+    typeof heightBar?.props?.onKeyDown === 'function' &&
+    String(heightBar?.props?.title ?? '').includes('528') === false &&
+    String(heightBar?.props?.title ?? '').includes('详情高度'),
+  heightBar?.props?.title,
+)
+check(
+  '竖杠提示里带「内容区 Npx」——排障时一眼能看出容器有多宽',
+  String(paneResizer?.props?.title ?? '').includes('内容区') && /当前 \d+px/.test(String(paneResizer?.props?.title ?? '')),
+  paneResizer?.props?.title,
+)
+
+const detailFullStates = []
+const detailFullNode = withInjectedState({ 0: tableData, 1: schemaResult, 5: 'rec1', 23: true }, () => renderComponent('TableModule', { ...tableProps, saveView: (patch) => detailFullStates.push(patch) }, 'TableModule（详情占满）'))
+check(
+  '点过「占满」：列表让位、拖拽条不出现（占满时没有宽度可拖），并给回「并排」按钮',
+  collectByType(detailFullNode, 'div').some((entry) => String(entry.props?.className ?? '').includes('is-detail-full')) &&
+    collectByType(detailFullNode, 'div').every((entry) => !String(entry.props?.className ?? '').includes('rdw-pane-resizer ')) &&
+    collectByType(detailFullNode, 'button').some((entry) => collectText(entry).join('') === '并排'),
+  collectByType(detailFullNode, 'button').map((entry) => collectText(entry).join('')),
+)
+collectByType(detailFullNode, 'button').find((entry) => collectText(entry).join('') === '并排')?.props?.onClick?.()
+check('点「并排」写回 detailFull=false（回到可拖宽度的左右分栏）', detailFullStates.some((patch) => patch.detailFull === false), detailFullStates)
+
+const detailFullOnStates = []
+const detailFullOnNode = withInjectedState({ 0: tableData, 1: schemaResult, 5: 'rec1' }, () => renderComponent('TableModule', { ...tableProps, saveView: (patch) => detailFullOnStates.push(patch) }, 'TableModule（点占满）'))
+collectByType(detailFullOnNode, 'button').find((entry) => collectText(entry).join('') === '占满')?.props?.onClick?.()
+check('点「占满」写回 detailFull=true（占满变成显式选择，不再按宽度自动触发）', detailFullOnStates.some((patch) => patch.detailFull === true), detailFullOnStates)
+check('拖拽条是「宽度/高度」两条独立路径，互不干扰（各有自己的拖动状态与提交键）', clientSource.includes('commit: (value) => saveView({ detailWidth: value })') && clientSource.includes('commit: (value) => saveView({ detailHeight: value })') && clientSource.includes('clampDetailHeight'))
+
+/* --------- 不拖也能改：−/＋ 步进（宿主万一吃掉鼠标事件时的保底） --------- */
+
+const stepStates = []
+const stepNode = withInjectedState({ 0: tableData, 1: schemaResult, 5: 'rec1' }, () => renderComponent('TableModule', { ...tableProps, saveView: (patch) => stepStates.push(patch) }, 'TableModule（步进）'))
+const widthCtl = collectByType(stepNode, 'span').find((entry) => String(entry.props?.className ?? '').includes('rdw-detail-widthctl'))
+const stepBtns = collectByType(widthCtl ?? { children: [] }, 'button')
+check(
+  '详情栏有「－ / 420px / ＋」步进控件（不依赖拖拽也能改宽度）',
+  stepBtns.length === 2 && collectText(widthCtl).join(' ').includes('420px'),
+  collectText(widthCtl).join(' '),
+)
+stepBtns[1]?.props?.onClick?.()
+stepBtns[0]?.props?.onClick?.()
+check(
+  '点 ＋ 写回 460px、点 － 回落 380px（都落进本表配置）',
+  stepStates.some((patch) => patch.detailWidth === 460) && stepStates.some((patch) => patch.detailWidth === 380),
+  stepStates,
+)
+check(
+  '窄窗口（上下排）隐藏调宽那组、显示「高 Npx」那组（CSS 切换，不靠 JS 猜布局）',
+  clientSource.includes('.rdw-detail-heightctl{display:none}') && clientSource.includes('.rdw-split.is-stacked .rdw-detail-widthctl{display:none}') && clientSource.includes('.rdw-split.is-stacked .rdw-detail-heightctl{display:inline-flex}') && collectByType(stepNode, 'span').some((entry) => String(entry.props?.className ?? '').includes('rdw-detail-heightctl')),
+  collectByType(stepNode, 'span').filter((entry) => String(entry.props?.className ?? '').includes('ctl')).map((entry) => entry.props?.className),
+)
+const stackedStates = []
+const stackedNode = withInjectedState({ 0: tableData, 1: schemaResult, 5: 'rec1', 24: true }, () => renderComponent('TableModule', { ...tableProps, saveView: (patch) => stackedStates.push(patch) }, 'TableModule（上下排）'))
+check(
+  '选「上下排」后 split 带 is-stacked（横杠负责高度、竖杠让位），且按钮变成「并排」',
+  collectByType(stackedNode, 'div').some((entry) => String(entry.props?.className ?? '').includes('is-stacked')) &&
+    collectByType(stackedNode, 'button').some((entry) => collectText(entry).join('') === '并排'),
+  collectByType(stackedNode, 'button').map((entry) => collectText(entry).join('')),
+)
+collectByType(stackedNode, 'button').find((entry) => collectText(entry).join('') === '并排')?.props?.onClick?.()
+check('点「并排」写回 detailStacked=false（回到拖宽度的左右分栏）', stackedStates.some((patch) => patch.detailStacked === false), stackedStates)
+const unstackStates = []
+collectByType(stepNode, 'button').find((entry) => collectText(entry).join('') === '上下排')?.props?.onClick?.()
+check('默认就是并排：工具栏给的是「上下排」按钮（点它才切）', collectByType(stepNode, 'button').some((entry) => collectText(entry).join('') === '上下排'))
+check(
+  '界面自检上报接通（客户端侧）：客户端把详情分栏几何报给 /ui/metrics',
+  clientSource.includes('${API}/ui/metrics') && clientSource.includes('reportMetrics({') && clientSource.includes('dragStarts: dragCounts.starts'),
+)
+check('容器晚出现也能测到宽度（从设置页回到内容区时重建模块）', clientSource.includes("state?.configured ? 'ready' : 'setup'"))
 
 /* --------- 自定义框架（customFrame）：顶栏 / 左导航 / 右侧原生对话 --------- */
 
 const frameProps = { service: {}, entry: {}, active: true, conversation: stubReact.createElement('div', { className: 'host-chat' }, '原生对话占位') }
-const frameState = { 1: { configured: true, settings: { projectDir: 'D:\\workspace\\dahua-skill\\dahua-skill-service' } } }
+const frameState = { 1: { configured: true, settings: { projectDir: 'D:\\workspace\\demo-project' } } }
 const frameClosed = withInjectedState(frameState, () => renderComponent('BusinessPanel', frameProps, 'BusinessPanel（框架·对话收起）'))
 const frameOpen = withInjectedState({ ...frameState, 10: true }, () => renderComponent('BusinessPanel', frameProps, 'BusinessPanel（框架·对话展开）'))
 check('照 SEO/GEO 工作台改用自定义框架（customFrame）', clientSource.includes('customFrame: true') && !clientSource.includes("businessSide: 'right'"))
@@ -936,7 +1239,7 @@ const sampleSkillsData = {
     { kind: 'agent', scope: 'project', convention: '.codex', group: '项目 skill · .codex · 角色/规范', id: 'p2', name: 'java-developer', dirName: 'java-developer', description: 'Java 开发角色', path: 'D:\\p\\.codex\\agents\\java-developer.md' },
   ],
   docs: [{ id: 'doc:03-coding', name: '03-coding', path: 'D:\\p\\doc\\standards\\03-coding.md' }],
-  projectDir: 'D:\\workspace\\dahua-skill\\dahua-skill-service',
+  projectDir: 'D:\\workspace\\demo-project',
   harnessSkillDir: 'C:\\Users\\EDY\\AppData\\Roaming\\dsh-desktop\\harness\\skills',
   summary: [
     { scope: 'harness', roots: 1, exists: 1, skills: 1, agents: 0 },
@@ -1005,11 +1308,10 @@ check('新建技能可以改成只放当前项目', collectText(skillsCreatingPr
 
 /* ------------------------------------------------------ 项目开发模块（AI 进度） */
 
-const taskTable = { key: 'task:dahua-skill-service', label: '开发任务 · dahua-skill-service', tableName: '开发任务表', kind: 'task', configPath: 'D:\\p\\.dev-task-sources.json', fieldMap: null }
+const taskTable = { key: 'task:demo-project', label: '开发任务 · demo-project', tableName: '开发任务表', kind: 'task', configPath: 'D:\\workspace\\demo-project\\.dev-task-sources.json', fieldMap: null }
 const devRuns = [
   { id: 'r1', at: '2026-10-22T10:00:00.000Z', title: '实现技能导入', status: 'done', recordId: 't1', tableKey: taskTable.key },
   { id: 'r2', at: '2026-10-22T11:00:00.000Z', title: '导出优化', status: 'in-progress', recordId: 't2', tableKey: taskTable.key },
-  { id: 'r3', at: '2026-10-22T12:00:00.000Z', title: '导出优化', status: 'blocked', recordId: 't2', tableKey: taskTable.key },
 ]
 const devData = {
   configured: true,
@@ -1027,8 +1329,18 @@ check('项目开发模块：任务清单列出每条任务与状态', devText.in
 check('项目开发模块：按状态统计任务进度', devText.includes('已完成 1') && devText.includes('开发中 1') && devText.includes('待开发 1') && devText.includes('整体完成度'), devText.slice(0, 200))
 check(
   '项目开发模块：合并工作台的 AI 执行记录（已完成/进行中/受阻/未开始）',
-  devText.includes('AI 开发进度') && devText.includes('已完成 1') && devText.includes('进行中 1') && devText.includes('受阻') && devText.includes('还没交给 AI 1'),
+  devText.includes('AI 开发进度') && devText.includes('已完成 1') && devText.includes('进行中 1') && devText.includes('受阻 0') && devText.includes('还没交给 AI 1'),
   devText.slice(0, 240),
+)
+check(
+  '角标取「最近一次」是按时间比（ISO 时间戳也要算对，不是数组顺序）',
+  pure.runBadge({ id: 't2', title: '导出优化' }, devRuns)?.status === 'done' === false &&
+    pure.runBadge({ id: 't2', title: '导出优化' }, devRuns)?.status === 'in-progress' &&
+    pure.runBadge({ id: 't2', title: '导出优化' }, [
+      { recordId: 't2', title: '导出优化', at: '2026-10-22T11:00:00.000Z', status: 'in-progress' },
+      { recordId: 't2', title: '导出优化', at: '2026-10-22T12:00:00.000Z', status: 'blocked' },
+    ])?.status === 'blocked',
+  pure.runBadge({ id: 't2', title: '导出优化' }, devRuns)?.status,
 )
 check('项目开发模块：有进度条与刷新入口', collectByType(devNode, 'i').some((node) => String(node.props?.style?.width ?? '').includes('%')) && devText.includes('刷新') && devText.includes('在任务表里看'))
 const devNoTable = withInjectedState({ 0: devData }, () => renderComponent('DevModule', { ...devProps, tables: [sampleTable] }, 'DevModule（没有任务表）'))
@@ -1038,7 +1350,7 @@ check('项目开发模块：任务表为空时提示怎么开始', collectText(d
 const devEmptyText = collectText(devEmpty).join(' ')
 check(
   '项目开发模块：任务表为空也列出 AI 执行记录（看得见进度）',
-  devEmptyText.includes('最近 AI 执行记录（3）') && devEmptyText.includes('实现技能导入') && devEmptyText.includes('已交付') && devEmptyText.includes('进行中'),
+  devEmptyText.includes('最近 AI 执行记录（2）') && devEmptyText.includes('实现技能导入') && devEmptyText.includes('已交付') && devEmptyText.includes('进行中'),
   devEmptyText.slice(0, 240),
 )
 const devNoRuns = withInjectedState({ 0: { configured: true, table: { fieldMap: { status: '状态' } }, items: [] } }, () => renderComponent('DevModule', { ...devProps, runs: [] }, 'DevModule（没执行记录）'))
@@ -1101,7 +1413,7 @@ const sampleExpertData = {
   summary: { harness: 1, global: 0, project: 1, custom: 0 },
   selected: '',
   targets: { harness: { dir: 'C:\\h\\agents', label: '通用' }, project: { dir: 'D:\\p\\.claude\\agents', label: '项目' } },
-  projectDir: 'D:\\workspace\\dahua-skill\\dahua-skill-service',
+  projectDir: 'D:\\workspace\\demo-project',
 }
 
 /* 技能来源分组：可收缩/展开 */
@@ -1175,8 +1487,14 @@ check('没选专家时不注入角色信息', pure.resolveExpertPick?.({ expert:
 const expertInstruction = pure.buildInstruction?.(sampleItem, { projectDir: 'D:\\p' }, null, pickExpert)
 check(
   '开发指令开头写上「以某专家身份」+ 角色定义文件',
-  String(expertInstruction).startsWith('请你以「老陈 · Java 后端开发专家」这个专家的身份来完成下面这条开发需求。') && String(expertInstruction).includes('角色定义文件：C:\\h\\agents\\java-backend-expert.md'),
+  String(expertInstruction).startsWith('/agent-teams\n\n请你以「老陈 · Java 后端开发专家」这个专家的身份来完成下面这条开发需求。') && String(expertInstruction).includes('角色定义文件：C:\\h\\agents\\java-backend-expert.md'),
   String(expertInstruction).slice(0, 150),
+)
+const plainInstruction = String(pure.buildInstruction?.(sampleItem, { projectDir: 'D:\\p' }, null, null))
+check(
+  '开发指令默认以 /agent-teams 开头（有无专家都一样）',
+  String(expertInstruction).startsWith('/agent-teams\n') && plainInstruction.startsWith('/agent-teams\n\n请在本地项目'),
+  plainInstruction.slice(0, 80),
 )
 const teamInstruction = pure.buildInstruction?.(sampleItem, { projectDir: 'D:\\p' }, null, pickTeam)
 check(
@@ -1635,9 +1953,9 @@ await writeFile(
   JSON.stringify(
     {
       version: 1,
-      defaultProject: 'dahua-skill-service',
+      defaultProject: 'demo-project',
       projects: {
-        'dahua-skill-service': {
+        'demo-project': {
           baseUrl: REAL_TASK_URL,
           tableName: '开发任务表',
           identity: 'user',
@@ -1672,7 +1990,7 @@ check(
   tableList.json?.tables?.map((table) => table.key),
 )
 
-const taskRecords = await call('GET', `/records?table=${encodeURIComponent('task:dahua-skill-service')}`)
+const taskRecords = await call('GET', `/records?table=${encodeURIComponent('task:demo-project')}`)
 if (taskRecords.json?.error) {
   warn('读开发任务表失败（环境/权限问题）', String(taskRecords.json.detail || '').slice(0, 200))
 } else {
@@ -1704,8 +2022,13 @@ const tmpLeftover = (await readdir(tmpdir())).filter((name) => String(name).star
 check('读完就删，临时目录不留 ndjson 垃圾', tmpLeftover.length === 0, tmpLeftover.slice(0, 5))
 
 
-const taskSchema = await call('GET', `/fields?table=${encodeURIComponent('task:dahua-skill-service')}`)
-check('读开发任务表的表结构', taskSchema.status === 200 && (taskSchema.json?.fields?.length ?? 0) > 0, (taskSchema.json?.fields ?? []).map((field) => field.name).slice(0, 6))
+const taskSchema = await call('GET', `/fields?table=${encodeURIComponent('task:demo-project')}`)
+if ((taskSchema.json?.fields?.length ?? 0) > 0) {
+  check('读开发任务表的表结构', taskSchema.status === 200, (taskSchema.json?.fields ?? []).map((field) => field.name).slice(0, 6))
+} else {
+  // 没配真实表（或本机 lark-cli 不可用）时，这条属环境问题，不能判代码失败
+  warn('读开发任务表的表结构（跳过：没配真实表或 lark-cli 不可用）', String(taskSchema.json?.detail || taskSchema.json?.error || '').slice(0, 200))
+}
 
 /* 回写飞书：命令名/参数必须和本机 lark-cli 对得上（用 --dry-run 验证，不真的写） */
 
@@ -1720,7 +2043,7 @@ check('回写用 +record-batch-update 的批量结构', (() => {
   )
 })(), buildBatchUpdatePayload('recA', '状态', '已领取', 'singleSelect'))
 
-const requirementRecords = await call('GET', `/records?table=${encodeURIComponent('requirement:dahua-skill-service')}`)
+const requirementRecords = await call('GET', `/records?table=${encodeURIComponent('requirement:demo-project')}`)
 const writeRecord = requirementRecords.json?.items?.[0]
 if (!writeRecord?.id) {
   warn('拿不到真实记录 ID，跳过回写 dry-run 检查', requirementRecords.json?.error ?? requirementRecords.json?.warning ?? '')
@@ -1741,13 +2064,13 @@ if (!writeRecord?.id) {
 
 /* 卡片字段可配置（按表持久化） */
 
-const cardFieldPatch = await call('POST', '/view', { tables: { 'requirement:dahua-skill-service': { cardFields: ['状态', '负责人'] } } })
-check('卡片字段配置可保存', cardFieldPatch.status === 200, cardFieldPatch.json?.view?.tables?.['requirement:dahua-skill-service'])
+const cardFieldPatch = await call('POST', '/view', { tables: { 'requirement:demo-project': { cardFields: ['状态', '负责人'] } } })
+check('卡片字段配置可保存', cardFieldPatch.status === 200, cardFieldPatch.json?.view?.tables?.['requirement:demo-project'])
 const viewBack = await call('GET', '/view')
 check(
   '卡片字段配置按表读回',
-  (viewBack.json?.view?.tables?.['requirement:dahua-skill-service']?.cardFields ?? []).join(',') === '状态,负责人',
-  viewBack.json?.view?.tables?.['requirement:dahua-skill-service'],
+  (viewBack.json?.view?.tables?.['requirement:demo-project']?.cardFields ?? []).join(',') === '状态,负责人',
+  viewBack.json?.view?.tables?.['requirement:demo-project'],
 )
 check('客户端有卡片字段配置入口与确认回写', clientSource.includes('卡片上展示哪些字段') && clientSource.includes('确认写回飞书'))
 
@@ -1760,12 +2083,12 @@ await call('POST', '/view', { railWidth: 9999 })
 check('侧边栏宽度超范围自动夹到 380', (await call('GET', '/view')).json?.view?.railWidth === 380)
 await call('POST', '/view', { railWidth: 236 })
 
-const renamePatch = await call('POST', '/view', { modules: [{ key: 'm1', tableKey: 'requirement:dahua-skill-service', title: '我的需求池', view: 'board' }] })
+const renamePatch = await call('POST', '/view', { modules: [{ key: 'm1', tableKey: 'requirement:demo-project', title: '我的需求池', view: 'board' }] })
 check('模块名称可保存', renamePatch.status === 200 && renamePatch.json?.view?.modules?.[0]?.title === '我的需求池', renamePatch.json?.view?.modules)
 const renamed = await call('GET', '/view')
 check(
   '模块名称按自定义值读回（不被表名覆盖）',
-  renamed.json?.view?.modules?.[0]?.title === '我的需求池' && renamed.json?.view?.modules?.[0]?.tableKey === 'requirement:dahua-skill-service',
+  renamed.json?.view?.modules?.[0]?.title === '我的需求池' && renamed.json?.view?.modules?.[0]?.tableKey === 'requirement:demo-project',
   renamed.json?.view?.modules?.[0],
 )
 
@@ -1784,7 +2107,7 @@ if (withProgress) {
 /* --------------------------------------------- 工作台执行记录（新） */
 
 console.log('\n[8] 工作台自己的执行记录')
-const runCreate = await call('POST', '/runs', { tableKey: 'requirement:dahua-skill-service', recordId: 'recSMOKE1', title: '冒烟测试·执行记录', projectDir: projectDir, note: '冒烟测试写入' })
+const runCreate = await call('POST', '/runs', { tableKey: 'requirement:demo-project', recordId: 'recSMOKE1', title: '冒烟测试·执行记录', projectDir: projectDir, note: '冒烟测试写入' })
 check('新增执行记录', runCreate.status === 200 && runCreate.json?.ok === true && runCreate.json.items.length === 1, runCreate.json?.error)
 const runId = runCreate.json?.run?.id
 const runUpdate = await call('POST', '/runs/status', { id: runId, status: 'done', note: '验证完成' })
@@ -1797,6 +2120,341 @@ check('执行记录按事件追加写在 runs.jsonl', await (async () => {
   return text.split('\n').filter(Boolean).length === 2
 })())
 check('非法状态被拒绝', (await call('POST', '/runs/status', { id: runId, status: '乱写' })).status === 400)
+
+// 同一个任务只留一条：再点一次「生成开发指令并复制」要更新这一条，而不是又多一条
+const runAgain = await call('POST', '/runs', { tableKey: 'requirement:demo-project', recordId: 'recSMOKE1', title: '冒烟测试·执行记录', projectDir: projectDir, note: '又点了一次' })
+check(
+  '同一条任务再点一次：regenerated=true，只有 1 条，次数 +1（不新增记录）',
+  runAgain.status === 200 && runAgain.json?.regenerated === true && runAgain.json.items.length === 1 && runAgain.json.items[0].generated === 2 && runAgain.json.items[0].id === runId,
+  { regenerated: runAgain.json?.regenerated, items: runAgain.json?.items?.length, generated: runAgain.json?.items?.[0]?.generated },
+)
+check('再生成只刷新时间/备注/项目，用户标过的状态不被冲掉', runAgain.json.items[0].status === 'done' && runAgain.json.items[0].note === '又点了一次' && runAgain.json.items[0].projectDir === projectDir)
+check('这条记录的历史也留全了（首建 → 标完成 → 再生成）', (runAgain.json.items[0].history ?? []).length === 3)
+check(
+  '换一个任务照旧单独成一条（不会把不同任务并到一起）',
+  (await call('POST', '/runs', { tableKey: 'requirement:demo-project', recordId: 'recSMOKE2', title: '冒烟测试·另一个任务' })).json.items.length === 2,
+)
+check('总览同口径：一个任务一条', (await call('GET', '/overview')).json.runs.length === 2)
+
+// 老数据（同一个任务已经被点出好几条）读出来就该合并成一条
+const legacyMerged = foldRuns([
+  { type: 'create', id: 'a', at: '2026-10-24T01:00:00.000Z', tableKey: 't1', recordId: 'recL', title: '老数据任务', status: 'handed-off' },
+  { type: 'create', id: 'b', at: '2026-10-24T02:00:00.000Z', tableKey: 't1', recordId: 'recL', title: '老数据任务', status: 'in-progress' },
+  { type: 'create', id: 'c', at: '2026-10-24T03:00:00.000Z', tableKey: 't1', recordId: 'recL', title: '老数据任务', status: 'handed-off' },
+  { type: 'update', id: 'c', at: '2026-10-24T03:30:00.000Z', status: 'done', note: '用户标完成' },
+])
+check(
+  '老数据里同一条任务的 3 条重复记录，读出来只剩 1 条（次数 3、状态取最近一次显式改动 done）',
+  legacyMerged.length === 1 && legacyMerged[0].generated === 3 && legacyMerged[0].status === 'done' && (legacyMerged[0].history ?? []).length === 4,
+  { count: legacyMerged.length, generated: legacyMerged[0]?.generated, status: legacyMerged[0]?.status, history: legacyMerged[0]?.history?.length },
+)
+check('按「表 + 记录 id」归并，两张表里同名记录不会串起来', runTaskKey({ tableKey: 't1', recordId: 'x' }) !== runTaskKey({ tableKey: 't2', recordId: 'x' }))
+check('没有记录 id 时退到标题归并（同标题算同一件事）', runTaskKey({ title: '只有标题' }) === runTaskKey({ tableKey: 't9', title: '只有标题', id: 'run-z' }))
+check('没有 recordId 的重复记录也合并成一条', foldRuns([
+  { type: 'create', id: 'p', at: '2026-10-24T01:00:00.000Z', title: '只有标题', status: 'handed-off' },
+  { type: 'create', id: 'q', at: '2026-10-24T02:00:00.000Z', title: '只有标题', status: 'handed-off' },
+]).length === 1)
+check(
+  '角标次数用记录里的生成次数（一条 deduped 记录也能显示 ×3）',
+  pure.runBadge({ id: 'rec1', title: 'x' }, [{ recordId: 'rec1', at: '2026-10-24T03:00:00.000Z', status: 'done', generated: 3 }])?.count === 3,
+)
+
+/* ============ v4：飞书文档（取文档信息）+ AI 全流程（专家团流水线） ============ */
+
+console.log('\n[9] 飞书文档：链接解析与返回体解析')
+check('文档链接：/docx/ 链接', (() => {
+  const parsed = parseDocInput('https://example.feishu.cn/docx/AbCdEf123456')
+  return parsed.doc === 'AbCdEf123456' && parsed.kind === 'docx'
+})())
+check('文档链接：/wiki/ 链接也收', parseDocInput('https://example.feishu.cn/wiki/WkToken9988').kind === 'wiki')
+check('文档链接：带 query 的链接照样认出 token', parseDocInput('https://x.feishu.cn/docx/Tok12345?from=space').doc === 'Tok12345')
+check('文档链接：裸 token', parseDocInput('Tok12345abcde').doc === 'Tok12345abcde')
+check('文档链接：空输入 / 明显不是 token 的一律不猜', parseDocInput('').doc === '' && parseDocInput('这是一句话不是链接').doc === '')
+
+check('文档返回体：成功时取到标题与正文（<title> 不当正文）', (() => {
+  const payload = parseDocPayload(JSON.stringify({
+    ok: true,
+    identity: 'user',
+    data: { document: { document_id: 'D1', revision_id: 12, content: '<title>支付对账需求</title>\n\n正文第一段\n正文第二段', tips: '' } },
+  }))
+  return payload.ok && payload.title === '支付对账需求' && payload.text.startsWith('正文第一段') && payload.revision === 12 && !payload.text.includes('<title>')
+})())
+check('文档返回体：失败时把人话与错误码都带出来', (() => {
+  const payload = parseDocPayload(JSON.stringify({ ok: false, error: { type: 'api', subtype: 'unknown', code: 3380002, message: 'Invalid document_id' } }))
+  return payload.ok === false && payload.error.includes('Invalid document_id') && String(payload.detail).includes('3380002')
+})())
+check('文档返回体：不是 JSON 时不假装成功', parseDocPayload('command not found').ok === false)
+check(
+  '界面自检上报接通（服务端侧）：POST 存内存、GET 可读；排障时直接读，不用你猜',
+  serverSource.includes("route === '/ui/metrics' && req.method === 'POST'") &&
+    serverSource.includes("route === '/ui/metrics' && req.method === 'GET'") &&
+    serverSource.includes('let uiMetrics = null') &&
+    serverSource.includes('uiMetrics = { ...body, at: new Date().toISOString() }'),
+)
+
+console.log('\n[10] 飞书文档接口（真实 handler）')
+const docsEmpty = await call('GET', '/docs')
+check('还没拉取过文档时清单为空', docsEmpty.status === 200 && Array.isArray(docsEmpty.json?.items) && docsEmpty.json.items.length === 0)
+const badDoc = await call('POST', '/doc/fetch', { input: '这不是链接' })
+check('不给链接时明确要求先给链接（400/502 都算拦住，不是静默成功）', badDoc.status >= 400 && !badDoc.json?.ok, { status: badDoc.status, error: badDoc.json?.error })
+const fakeDoc = await call('POST', '/doc/fetch', { input: 'https://example.feishu.cn/docx/FAKETOKENFAKETOKEN' })
+if (fakeDoc.status === 502) {
+  // 拿一篇不存在的文档去打真实 lark-cli：要的是「干净报错」，而不是崩掉或假装成功。
+  check('文档读不到时：干净报错并带上实际命令，不落盘、不谎报成功', Boolean(fakeDoc.json?.error) && !fakeDoc.json?.ok, { error: String(fakeDoc.json?.error ?? '').slice(0, 120), command: fakeDoc.json?.command })
+  check('拉取失败不会往清单里塞东西', (await call('GET', '/docs')).json?.items?.length === 0)
+} else {
+  warn('本地 lark-cli 这次没按预期报错（环境问题），跳过文档失败路径检查', { status: fakeDoc.status, error: fakeDoc.json?.error })
+}
+check('移除一篇不存在的文档也不报错（幂等）', (await call('POST', '/doc/remove', { id: 'nope' })).status === 200)
+
+console.log('\n[11] AI 全流程：阶段与折叠')
+check('四段流程就是需求分析 → 开发 → 评审 → QA', FLOW_STAGES.map((stage) => stage.name).join('→') === '需求分析→代码开发→代码评审→QA 测试', FLOW_STAGES)
+check('每个阶段都挂了本机已有的专家角色（DSH_HOME/agents）', FLOW_STAGES.every((stage) => stage.role) && FLOW_STAGES.map((stage) => stage.role).join(',') === 'product-requirement-expert,fullstack-architect,code-review-expert,qa-test-expert')
+check('阶段名可反查（未知 id 原样返回，不瞎编）', flowStageName('review') === '代码评审' && flowStageName('unknown-stage') === 'unknown-stage')
+check('状态集合：待开始/进行中/已完成/已完成·无凭据/受阻', FLOW_STATUS.map((entry) => entry.label).join(',') === '待开始,进行中,已完成,已完成 · 无凭据,受阻')
+check('凭据种类五类，且不含「备注」', FLOW_EVIDENCE_KINDS.map((entry) => entry.id).join(',') === 'command,files,test,url,spec')
+check('每段都要求凭据（needsEvidence）', FLOW_STAGES.every((stage) => stage.needsEvidence === true))
+
+check('折叠两条事件：创建 + 阶段更新', (() => {
+  const flows = foldFlows([
+    { type: 'create', id: 'f1', at: '2026-01-01T00:00:00.000Z', title: '对账导出', recordId: 'rec1', team: 'team:x', teamName: '专家团 · x' },
+    { type: 'stage', id: 'f1', at: '2026-01-01T01:00:00.000Z', stage: 'analyze', status: 'done', note: '范围已确认' },
+  ])
+  const flow = flows[0]
+  const analyze = flow.stages.find((stage) => stage.id === 'analyze')
+  return flows.length === 1 && flow.stages.length === 4 && analyze.status === 'done' && analyze.note === '范围已确认' && flowPercent(flow) === 25
+})())
+check('非法阶段状态不写进去（脏数据挡在门外）', (() => {
+  const flows = foldFlows([
+    { type: 'create', id: 'f2', at: '2026-01-01T00:00:00.000Z', title: 't' },
+    { type: 'stage', id: 'f2', at: '2026-01-01T01:00:00.000Z', stage: 'develop', status: '乱写' },
+  ])
+  return flows[0].stages.find((stage) => stage.id === 'develop').status === 'pending'
+})())
+check('移除后的流水线不再出现', foldFlows([
+  { type: 'create', id: 'f3', at: '2026-01-01T00:00:00.000Z', title: 't' },
+  { type: 'remove', id: 'f3', at: '2026-01-01T02:00:00.000Z' },
+]).length === 0)
+check('没有 create 的孤儿事件不会造出流水线', foldFlows([{ type: 'stage', id: 'ghost', stage: 'qa', status: 'done' }]).length === 0)
+
+console.log('\n[11b] v4.2 阶段凭据：折叠、删除、老数据与台账口径')
+check('凭据事件挂到对应阶段上（未知类型退成 command、空摘要丢弃）', (() => {
+  const flows = foldFlows([
+    { type: 'create', id: 'f4', at: '2026-01-01T00:00:00.000Z', title: 't' },
+    { type: 'evidence', id: 'f4', at: '2026-01-01T00:30:00.000Z', stage: 'develop', kind: 'files', summary: 'src/a.ts | 12 +++++' },
+    { type: 'evidence', id: 'f4', at: '2026-01-01T00:40:00.000Z', stage: 'develop', kind: '乱写', summary: '按命令处理' },
+    { type: 'evidence', id: 'f4', at: '2026-01-01T00:50:00.000Z', stage: 'develop', kind: 'test', summary: '   ' },
+  ])
+  const develop = flows[0].stages.find((stage) => stage.id === 'develop')
+  return develop.evidence.length === 2 && develop.evidence[1].kind === 'command'
+})())
+check('凭据可删（按事件时间匹配，别的凭据不受影响）', (() => {
+  const flows = foldFlows([
+    { type: 'create', id: 'f5', at: '2026-01-01T00:00:00.000Z', title: 't' },
+    { type: 'evidence', id: 'f5', at: '2026-01-01T01:00:00.000Z', stage: 'qa', kind: 'test', summary: 'A' },
+    { type: 'evidence', id: 'f5', at: '2026-01-01T02:00:00.000Z', stage: 'qa', kind: 'test', summary: 'B' },
+    { type: 'evidence-remove', id: 'f5', at: '2026-01-01T03:00:00.000Z', stage: 'qa', targetAt: '2026-01-01T01:00:00.000Z' },
+  ])
+  const qa = flows[0].stages.find((stage) => stage.id === 'qa')
+  return qa.evidence.length === 1 && qa.evidence[0].summary === 'B'
+})())
+check('老 flows.jsonl（阶段没有 evidence 字段）读出来不崩，按空数组处理', (() => {
+  const flows = foldFlows([{ type: 'create', id: 'f6', at: '2026-01-01T00:00:00.000Z', title: 't' }])
+  return Array.isArray(flows[0].stages[0].evidence) && flows[0].stages[0].evidence.length === 0
+})())
+check('「已完成 · 无凭据」也推进度，但台账里与有凭据完成分开数', (() => {
+  const flows = foldFlows([
+    { type: 'create', id: 'f7', at: '2026-01-01T00:00:00.000Z', title: 't' },
+    { type: 'evidence', id: 'f7', at: '2026-01-01T00:10:00.000Z', stage: 'analyze', kind: 'files', summary: 'x' },
+    { type: 'stage', id: 'f7', at: '2026-01-01T00:20:00.000Z', stage: 'analyze', status: 'done' },
+    { type: 'stage', id: 'f7', at: '2026-01-01T00:30:00.000Z', stage: 'develop', status: 'done_unverified' },
+  ])
+  const stats = flowEvidenceStats(flows[0])
+  return flowPercent(flows[0]) === 50 && stats.evidence === 1 && stats.unverified === 1 && stats.done === 2 && stats.stages === 4
+})())
+check('验收标准检查：能失败的通过，含糊的标黄', (() => {
+  const text = [
+    '# 某某需求 spec',
+    '',
+    '## 验收标准',
+    '',
+    '- 当邮箱已注册时，接口返回 409 并提示「邮箱已被占用」',
+    '- 注册功能正常工作',
+    '- 用户能登录',
+    '',
+    '## 其他',
+    '- 这条不在验收标准段里，不该被算进去',
+  ].join('\n')
+  const result = checkAcceptanceCriteria(text)
+  return result.found === true && result.total === 3 && result.weak.length === 2 && result.weak[0].index === 2 && result.weak[0].text === '注册功能正常工作'
+})())
+check('验收标准检查：没有「验收标准」段落时明确说没找到，不瞎判', (() => {
+  const result = checkAcceptanceCriteria('# 设计说明\n\n这里只有背景和方案，没有验收标准段。')
+  return result.found === false && result.total === 0 && result.weak.length === 0
+})())
+
+console.log('\n[12] AI 全流程接口（真实 handler）')
+const flowsEmpty = await call('GET', '/flows')
+check('还没建流水线时清单为空，且带出四段定义', flowsEmpty.status === 200 && flowsEmpty.json?.items?.length === 0 && flowsEmpty.json?.stages?.length === 4)
+check('不带任务就开流水线会被拦住', (await call('POST', '/flows', { title: '' })).status === 400)
+const flowCreate = await call('POST', '/flows', { recordId: 'recSMOKE2', tableKey: 'task:demo-project', title: '冒烟测试·全流程', team: 'team:fullstack-delivery-team', teamName: '专家团 · 全栈交付' })
+check('开一条全流程：四段都是待开始', flowCreate.status === 200 && flowCreate.json?.items?.[0]?.stages?.length === 4 && flowCreate.json.items[0].stages.every((stage) => stage.status === 'pending'), flowCreate.json?.error)
+const flowId = flowCreate.json?.items?.[0]?.id
+const flowStage = await call('POST', '/flows/stage', { id: flowId, stage: 'analyze', status: 'done', note: '需求说明已出' })
+check('无凭据标完成：被降级成「已完成 · 无凭据」，不是 done', flowStage.status === 200 && flowStage.json?.downgraded === true && flowStage.json?.items?.[0]?.stages?.[0]?.status === 'done_unverified' && flowStage.json.items[0].stages[0].note === '需求说明已出')
+check('凭据不能为空（一句话「已完成」不算数）', (await call('POST', '/flows/evidence', { id: flowId, stage: 'analyze', kind: 'command', summary: '   ' })).status === 400)
+check('凭据类型必须在白名单里', (await call('POST', '/flows/evidence', { id: flowId, stage: 'analyze', kind: '乱写', summary: 'x' })).status === 400)
+const evAdd = await call('POST', '/flows/evidence', { id: flowId, stage: 'analyze', kind: 'files', summary: 'src/a.ts | 12 +++++' })
+check('贴一条凭据能读回，并挂在对应阶段上', evAdd.status === 200 && evAdd.json?.items?.[0]?.stages?.[0]?.evidence?.length === 1 && evAdd.json.items[0].stages[0].evidence[0].kind === 'files')
+const flowStageDone = await call('POST', '/flows/stage', { id: flowId, stage: 'analyze', status: 'done', note: '需求说明已出' })
+check('有凭据再标完成：就是 done，不被降级', flowStageDone.status === 200 && flowStageDone.json?.downgraded === false && flowStageDone.json?.items?.[0]?.stages?.[0]?.status === 'done')
+check('非法阶段状态被拒绝', (await call('POST', '/flows/stage', { id: flowId, stage: 'analyze', status: '乱写' })).status === 400)
+check('缺阶段 id 被拒绝', (await call('POST', '/flows/stage', { id: flowId, status: 'done' })).status === 400)
+const flowsBack = await call('GET', '/flows')
+check('流水线可读回（刷新后还在，且带凭据）', flowsBack.json?.items?.[0]?.id === flowId && (() => {
+  const analyze = flowsBack.json.items[0].stages.find((stage) => stage.id === 'analyze')
+  return analyze.status === 'done' && analyze.evidence.length === 1
+})())
+check('流水线按事件追加写在 flows.jsonl（create + 两次状态 + 一条凭据）', await (async () => {
+  const { readFile } = await import('node:fs/promises')
+  const text = await readFile(join(root, 'flows.jsonl'), 'utf8').catch(() => '')
+  const events = text.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  return events.length === 4 && events.filter((event) => event.type === 'stage').length === 2 && events.filter((event) => event.type === 'evidence').length === 1
+})())
+check('移除流水线后不再出现在清单里', (await call('POST', '/flows/remove', { id: flowId })).json?.items?.length === 0)
+
+console.log('\n[12b] v4.2 spec 文档：扫描、读取、验收标准检查')
+const specScan = await call('GET', '/spec-scan')
+check('扫到项目里 skill 产出的 spec 文档', specScan.status === 200 && specScan.json?.ok === true && (specScan.json.items ?? []).some((item) => item.name === 'cursor-paging.spec.md'), specScan.json?.error)
+const specPath = (specScan.json?.items ?? []).find((item) => item.name === 'cursor-paging.spec.md')?.path
+const specRead = await call('POST', '/spec-read', { path: specPath })
+check('读 spec：正文拉得到，验收标准 2 条、其中 1 条不可判定', specRead.status === 200 && specRead.json?.checks?.found === true && specRead.json.checks.total === 2 && specRead.json.checks.weak.length === 1 && specRead.json.checks.weak[0].text === '分页要正常工作', specRead.json?.error)
+check('读 spec 走白名单：扫描范围外的文件一律拒绝', (await call('POST', '/spec-read', { path: join(projectDir, 'AGENTS.md') })).status === 400)
+check('认不出的表不静默丢弃：直接写表名会给出原因', await (async () => {
+  const dir = join(root, 'fake-dropped')
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, '.requirement-sources.json'), JSON.stringify({
+    sources: {
+      正常表: { baseUrl: `https://x.feishu.cn/base/${BASE_TOKEN}?table=tblABCDEF123456` },
+      写错表: { baseUrl: `https://x.feishu.cn/base/${BASE_TOKEN}?table=需求池` },
+    },
+  }), 'utf8')
+  const result = await listTables({ root, identity: 'user', skillsRoots: [], larkCli: '' }, { projectDir: dir })
+  return result.tables.length === 1 && result.dropped.length === 1 && result.dropped[0].label === '开发需求 · 写错表' && /不像飞书表 id/.test(result.dropped[0].reason)
+})())
+
+console.log('\n[13] v4 客户端：新模块与改名都到位，没留旧名字')
+check('已改名并定位为「AI Native 工作台」', clientSource.includes("title: 'AI Native 工作台'") && clientSource.includes("panelTitle: 'AI Native'"))
+check('注册时仍是自定义整块框架（整页业务 + 按需对话）', clientSource.includes('customFrame: true'))
+check('左边导航里有「AI 全流程」和「飞书文档」两个新模块', clientSource.includes("label: 'AI 全流程'") && clientSource.includes("label: '飞书文档'"))
+check('全流程模块：四段 + 复制指令 + 发进对话 + 受阻可重试', clientSource.includes('FLOW_STAGE_BRIEF') && clientSource.includes('复制指令') && clientSource.includes('发进对话') && clientSource.includes('重试这一阶段'))
+check('阶段指令带上专家/专家团角色与前面阶段的进展', clientSource.includes('function stageInstruction') && clientSource.includes('前面阶段的进展') && clientSource.includes('expertInstructionLines(pick)'))
+check('飞书文档模块：拉取 + 复制正文 + 送进对话', clientSource.includes('function DocsModule') && clientSource.includes('拉取文档') && clientSource.includes('复制正文') && clientSource.includes('送进对话'))
+check('新增样式按业务容器宽度自适应（窄容器不塌）', clientSource.includes('.rdw-stage{') && clientSource.includes('.rdw-select{') && clientSource.includes('.rdw-docbody{'))
+
+/* --------- 更新日志：包内 CHANGELOG.md -> /changelog -> 版本号弹窗 --------- */
+
+const changelogText = await readFile(new URL('../CHANGELOG.md', import.meta.url), 'utf8').catch(() => '')
+const changelogSections = changelogText ? parseChangelog(changelogText) : []
+check(
+  '更新日志能解析出版本段（版本号 + 日期 + 条目）',
+  changelogSections.length > 0 && changelogSections.every((section) => /^\d+\.\d+\.\d+$/u.test(section.version) && section.items.length > 0),
+  changelogSections.slice(0, 3).map((section) => `v${section.version}(${section.items.length})`),
+)
+check(
+  '更新日志最新一段就是 package.json 里的版本（发版前必须先写这页）',
+  changelogSections[0]?.version === JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version,
+  [changelogSections[0]?.version],
+)
+check(
+  '更新日志只取版本段内的条目，说明性文字不进列表',
+  parseChangelog('# 更新日志\n\n说明段落\n\n## v9.9.9 — 2026-01-01\n\n- 第一条\n- 第二条\n\n### 小节标题\n\n- 小节里的不算\n\n## 维护约定\n\n- 约定不算').length === 1 &&
+    parseChangelog('## v9.9.9 — 2026-01-01\n\n- 第一条\n- 第二条\n\n### 小节标题\n\n- 小节里的不算\n\n## 维护约定\n\n- 约定不算')[0]?.items.join('|') === '第一条|第二条',
+  parseChangelog('## v9.9.9 — 2026-01-01\n\n- 第一条\n- 第二条\n\n### 小节标题\n\n- 小节里的不算\n\n## 维护约定\n\n- 约定不算')[0]?.items,
+)
+check('更新日志接口挂在 /changelog 且只读', clientSource.includes("api('/changelog')") && serverSource.includes("route === '/changelog'") && serverSource.includes("req.method === 'GET'"))
+check(
+  '左栏底部有「更新日志」入口，点开是弹窗且标出当前版本',
+  clientSource.includes("'更新日志'") &&
+    clientSource.includes('ChangelogDialog') &&
+    clientSource.includes('当前版本') &&
+    clientSource.includes('rdw-cl-section'),
+)
+check('v4.2 阶段凭据：贴凭据入口、无凭据角标、二次确认都在', ['贴凭据', '无凭据', '仍标为已完成（无凭据）', '备注不算凭据'].every((text) => clientSource.includes(text)))
+check('v4.2 阶段指令要求给出能贴回工作台的凭据', clientSource.includes('不能只写「已完成」') && clientSource.includes('凭据要能一行一条贴回工作台'))
+check('v4.2 上一阶段的凭据（含 spec 路径）会带进下一阶段指令', clientSource.includes('function evidenceBrief') && clientSource.includes('凭据来自上一阶段自己的产出'))
+check('v4.2 空表文案分清「表就是空的」与「被筛选掉了」', clientSource.includes('function emptyTableText') && clientSource.includes('已成功读取，表内暂无记录') && clientSource.includes("'任务' : '需求'"))
+check('v4.2 总览：0 条时标「表内暂无记录」，认不出的表给出原因', clientSource.includes('0 条（表内暂无记录）') && clientSource.includes('张表没被认出来'))
+check('仓库身份没有被改掉（仍是同一个工作台，不会变成第二个入口）', clientSource.includes("repository: 'https://github.com/local-dev-workbench/dsh-requirement-dev-workbench'"))
+check('界面上不再出现旧名字「需求开发工作台」', !clientSource.includes('需求开发工作台'))
+
+console.log('\n[14] 两个新模块真的能渲染（桩 React 跑组件函数体）')
+
+const docsEmptyNode = withInjectedState({}, () => renderComponent('DocsModule', { service: {} }, 'DocsModule（还没拉取）'))
+check('飞书文档模块：空态给引导语而不是空白', collectText(docsEmptyNode).join(' ').includes('还没拉取过文档'))
+const docsListNode = withInjectedState(
+  {
+    3: [{ id: 'D1', title: '支付对账需求说明（Payment reconciliation spec）', kind: 'docx', chars: 12345, addedAt: '2026-10-24T02:00:00.000Z', url: 'https://x.feishu.cn/docx/D1' }],
+    4: 'D1',
+    5: { id: 'D1', title: '支付对账需求说明（Payment reconciliation spec）' },
+    6: '正文第一段：对账页支持批量导出。\nSecond paragraph in English.',
+  },
+  () => renderComponent('DocsModule', { service: {} }, 'DocsModule（有文档）'),
+)
+const docsText = collectText(docsListNode).join(' ')
+check(
+  '飞书文档模块：清单 + 正文 + 复制 / 送进对话都在',
+  docsText.includes('支付对账需求说明') && docsText.includes('12345 字') && docsText.includes('复制正文') && docsText.includes('送进对话') && docsText.includes('正文第一段'),
+  docsText.slice(0, 160),
+)
+
+const sampleFlow = {
+  id: 'f1',
+  at: '2026-10-24T02:00:00.000Z',
+  title: '对账页支持批量导出',
+  recordId: 'rec1',
+  tableKey: 'task:x',
+  team: 'team:fullstack-delivery-team',
+  teamName: '专家团 · 全栈交付',
+  stages: [
+    { id: 'analyze', status: 'done', note: '范围已确认', at: '2026-10-24T03:00:00.000Z' },
+    { id: 'develop', status: 'running', note: '', at: '' },
+    { id: 'review', status: 'blocked', note: '等接口联调', at: '' },
+    { id: 'qa', status: 'pending', note: '', at: '' },
+  ],
+}
+const flowProps = {
+  state: { settings: { projectDir: 'D:\\workspace\\demo-project', expert: 'team:fullstack-delivery-team' } },
+  tables: [{ key: 'task:x', label: '开发任务 · x', kind: 'task' }],
+  expertData: sampleExpertData,
+  service: {},
+}
+const flowEmptyNode = withInjectedState({}, () => renderComponent('FlowModule', flowProps, 'FlowModule（还没建流水线）'))
+check('全流程模块：没流水线时给引导语而不是空白', collectText(flowEmptyNode).join(' ').includes('还没有流水线'))
+const flowNode = withInjectedState(
+  { 0: [sampleFlow], 1: [{ id: 'rec1', title: '对账页支持批量导出', code: 'T-1' }], 3: 'rec1', 4: 'team:fullstack-delivery-team' },
+  () => renderComponent('FlowModule', flowProps, 'FlowModule（有一条流水线）'),
+)
+const flowText = collectText(flowNode).join(' ')
+check(
+  '全流程模块：四段 + 状态角标 + 复制指令 / 发进对话都在',
+  ['需求分析', '代码开发', '代码评审', 'QA 测试'].every((name) => flowText.includes(name)) &&
+    flowText.includes('已完成') && flowText.includes('受阻') && flowText.includes('进行中') &&
+    flowText.includes('复制指令') && flowText.includes('发进对话') && flowText.includes('存备注'),
+  flowText.slice(0, 200),
+)
+check('全流程模块：完成度按阶段算出来（1/4 = 25%）', flowText.includes('25%'), flowText.match(/\d+%/g))
+check('全流程模块：受阻的阶段才出现「重试这一阶段」', flowText.includes('重试这一阶段'))
+check(
+  '全流程模块：每段备注回填到各自输入框 + 角色显示出来',
+  collectByType(flowNode, 'input').map((node) => String(node.props.value ?? '')).includes('范围已确认') &&
+    collectByType(flowNode, 'input').map((node) => String(node.props.value ?? '')).includes('等接口联调') &&
+    collectText(flowNode).join(' ').includes('专家团 · 全栈交付'),
+  collectByType(flowNode, 'input').map((node) => String(node.props.value ?? '')),
+)
+check('左边导航同时有「AI 全流程」与「飞书文档」入口', collectText(railFrame).join(' ').includes('AI 全流程') && collectText(railFrame).join(' ').includes('飞书文档'), collectText(railFrame).join(' ').slice(0, 150))
+check('顶栏与左栏都显示新名字「AI Native 工作台」', collectText(frameClosed).join(' ').includes('AI Native 工作台'))
+check('新增阶段行会换行不塌（窄容器也不裁切）', clientSource.includes('.rdw-stage{') && clientSource.includes('flex-wrap:wrap') && clientSource.includes('.rdw-stage-note{'))
 
 await rm(root, { recursive: true, force: true })
 

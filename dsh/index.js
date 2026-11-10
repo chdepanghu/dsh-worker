@@ -1,5 +1,5 @@
 /**
- * 需求开发工作台 · 服务端入口
+ * AI Native 工作台（包名沿用 dsh-requirement-dev-workbench）· 服务端入口
  *
  * 职责：
  *  - 把工作台设置（飞书多维表格地址、所选项目目录、技能根目录）持久化到 DSH 数据目录；
@@ -12,8 +12,9 @@
 import { spawn } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { readFile, mkdir, readdir, rm, writeFile, appendFile } from 'node:fs/promises'
+import { readFile, mkdir, readdir, rm, stat, writeFile, appendFile } from 'node:fs/promises'
 import { dirname, join, relative, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 
 export const name = 'requirement-dev-workbench'
@@ -390,8 +391,31 @@ export async function listTables(config, settings) {
       }),
     )
   }
-  const usable = tables.filter((table) => table.baseToken && table.tableId)
-  return { tables: usable, requirementConfig: requirement?.path ?? '', taskConfig: tasks?.path ?? '' }
+  // 不静默丢表：认不出来的表要留下原因，界面上可见（诊断报告 P3）。
+  const usable = []
+  const dropped = []
+  for (const table of tables) {
+    if (!table.baseToken) {
+      dropped.push({ key: table.key, label: table.label, configPath: table.configPath, reason: '缺 baseToken：配置里的链接认不出多维表格 base，请贴完整链接' })
+      continue
+    }
+    if (!table.tableId) {
+      dropped.push({ key: table.key, label: table.label, configPath: table.configPath, reason: '缺 tableId：配置里没有 table 参数' })
+      continue
+    }
+    // 飞书表 id 恒为 tblxxxx。以前把「表名」当 id 传下去，lark-cli 只会报一句看不懂的错。
+    if (!/^tbl[A-Za-z0-9]+$/.test(table.tableId)) {
+      dropped.push({
+        key: table.key,
+        label: table.label,
+        configPath: table.configPath,
+        reason: `tableId 不像飞书表 id（${table.tableId}）：链接里应该是 ?table=tblxxxx，不能直接写表名`,
+      })
+      continue
+    }
+    usable.push(table)
+  }
+  return { tables: usable, dropped, requirementConfig: requirement?.path ?? '', taskConfig: tasks?.path ?? '' }
 }
 
 export async function findTable(config, settings, key) {
@@ -408,6 +432,8 @@ export async function findTable(config, settings, key) {
 const recordCache = new Map()
 // 最近一次上报的会话 id（来自对话输入框的专家入口），只存内存，不落盘、不含任何凭证。
 let composerSession = { id: '', at: 0 }
+/** 界面自检上报的最后一帧（内存里，用于排障；不落盘、无凭证）。 */
+let uiMetrics = null
 const RECORD_CACHE_MS = 60_000
 
 /** 读一张表的原始记录（60 秒内存缓存，可 fresh 强制刷新）。 */
@@ -564,7 +590,7 @@ export function summarizeProgress(items, field) {
 
 /** 跨表总览：每张表的总数、按状态字段的进度分布、几条样例。 */
 async function buildOverview(config, settings, { fresh = false } = {}) {
-  const { tables } = await listTables(config, settings)
+  const { tables, dropped } = await listTables(config, settings)
   const out = []
   for (const table of tables) {
     const payload = await fetchTableRecords(config, table, { fresh })
@@ -587,7 +613,7 @@ async function buildOverview(config, settings, { fresh = false } = {}) {
       sample: items.slice(0, 4).map((item) => ({ id: item.id, title: item.title, status: item.status, owner: item.owner })),
     })
   }
-  return { tables: out, generatedAt: new Date().toISOString() }
+  return { tables: out, dropped, generatedAt: new Date().toISOString() }
 }
 
 /* ------------------------------------------- 工作台自己的执行记录（runs） */
@@ -596,14 +622,37 @@ function runsFile(config) {
   return join(config.root, 'runs.jsonl')
 }
 
-/** 事件流 -> 最新状态（每个 id 一条，附历史）。 */
+/**
+ * 一条执行记录属于哪个任务：优先「表 + 记录 id」，没有 id 时退到标题。
+ * 「同一个任务只留一条记录」全靠这个键 —— 重复生成开发指令时更新这一条，而不是再加一条。
+ */
+export function runTaskKey(run) {
+  const recordId = String(run?.recordId ?? '').trim()
+  if (recordId) return `${String(run?.tableKey ?? '').trim()}|${recordId}`
+  const title = String(run?.title ?? '').trim()
+  if (title) return `title|${title}`
+  return `id|${String(run?.id ?? '').trim()}`
+}
+
+/** 事件流 -> 最新状态（每个任务一条，附历史与「生成过几次」）。 */
 export function foldRuns(events) {
   const map = new Map()
   for (const event of events) {
     if (!event || typeof event !== 'object') continue
     if (event.type === 'create') {
       const status = event.status || 'handed-off'
-      map.set(event.id, { ...event, status, history: [{ at: event.at, status, note: event.note ?? '' }] })
+      map.set(event.id, { ...event, status, generated: Number(event.generated ?? 1), history: [{ at: event.at, status, note: event.note ?? '' }] })
+      continue
+    }
+    if (event.type === 'regenerate' && map.has(event.id)) {
+      // 同一条任务又生成了一次：刷新时间/项目/备注，保留用户已经标好的状态，只把次数 +1。
+      const run = map.get(event.id)
+      run.at = event.at ?? run.at
+      if (event.title) run.title = event.title
+      if (event.projectDir !== undefined) run.projectDir = event.projectDir
+      if (event.note) run.note = event.note
+      run.generated = Number(run.generated ?? 1) + 1
+      run.history = [...(run.history ?? []), { at: event.at, status: run.status, note: event.note || '再次生成开发指令' }]
       continue
     }
     if (event.type === 'update' && map.has(event.id)) {
@@ -614,7 +663,30 @@ export function foldRuns(events) {
       run.history = [...(run.history ?? []), { at: event.at, status: run.status, note: event.note ?? '' }]
     }
   }
-  return [...map.values()].sort((a, b) => String(b.at).localeCompare(String(a.at)))
+  // 老记录里同一条任务可能已经被点出好几条：这里按任务键合并，取最近的一条当代表，
+  // 历史合并、次数累加，状态以「最近一次显式改动」为准 —— 于是总览里一个任务只有一条。
+  const byTask = new Map()
+  for (const run of [...map.values()].sort((a, b) => String(a.at).localeCompare(String(b.at)))) {
+    const key = runTaskKey(run)
+    const hit = byTask.get(key)
+    if (!hit) {
+      byTask.set(key, { ...run, generated: Number(run.generated ?? 1) })
+      continue
+    }
+    const rank = (item) => String(item.updatedAt ?? item.at ?? '')
+    const newer = String(run.at ?? '') >= String(hit.at ?? '') ? run : hit
+    const older = newer === run ? hit : run
+    const statusSource = rank(newer) >= rank(older) ? newer : older
+    byTask.set(key, {
+      ...newer,
+      status: statusSource.status ?? newer.status,
+      note: (rank(newer) >= rank(older) ? newer.note : older.note) ?? newer.note ?? '',
+      generated: Number(older.generated ?? 1) + Number(newer.generated ?? 1),
+      history: [...(older.history ?? []), ...(newer.history ?? [])].sort((a, b) => String(a.at).localeCompare(String(b.at))),
+      mergedIds: [...new Set([...(older.mergedIds ?? [older.id]), ...(newer.mergedIds ?? [newer.id])])],
+    })
+  }
+  return [...byTask.values()].sort((a, b) => String(b.at).localeCompare(String(a.at)))
 }
 
 async function readRuns(config) {
@@ -1601,6 +1673,537 @@ async function createTeam(config, settings, body) {
   return { ok: true, kind: 'team', id, scope, path: file.path, members, lead, overwrote: Boolean(body?.overwrite) }
 }
 
+/* ------------------------------------------------- 飞书文档（文档信息） */
+
+/** 从粘贴的飞书链接/token 里认出文档坐标（/docx/、/docs/、/wiki/、/file/ 都收）。 */
+export function parseDocInput(input) {
+  const text = String(input ?? '').trim()
+  if (!text) return { doc: '', kind: '', url: '' }
+  if (/^https?:/i.test(text)) {
+    const hit = /\/(docx|docs|wiki|file)\/([A-Za-z0-9]+)/.exec(text)
+    return { doc: hit ? hit[2] : '', kind: hit ? hit[1] : '', url: text }
+  }
+  const token = text.split(/[\s,|]+/).filter(Boolean)[0] ?? ''
+  return { doc: /^[A-Za-z0-9_-]{6,}$/.test(token) ? token : '', kind: '', url: '' }
+}
+
+/**
+ * `lark-cli docs +fetch` 的返回 -> { title, text }。
+ * 成功：{ ok:true, data:{ document:{ document_id, revision_id, content, tips } } }
+ * 失败：{ ok:false, error:{ type, subtype, code, message, hint } }（授权类的 JSON 走 stderr）
+ */
+export function parseDocPayload(stdout) {
+  const raw = String(stdout ?? '').trim()
+  let parsed = null
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    parsed = null
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return { ok: false, error: 'lark-cli 没返回可解析的 JSON', detail: raw.slice(0, 600) }
+  }
+  if (parsed.ok === false) {
+    const error = parsed.error ?? {}
+    return {
+      ok: false,
+      error: String(error.message || error.subtype || '读取飞书文档失败'),
+      detail: `type=${error.type ?? '?'} code=${error.code ?? '?'}`,
+      hint: String(error.hint ?? ''),
+      source: 'lark-cli',
+    }
+  }
+  const document = parsed?.data?.document ?? {}
+  const content = String(document.content ?? '')
+  const titleTag = /<title>([\s\S]*?)<\/title>/i.exec(content)
+  const heading = /^#{1,3}\s+(.+)$/m.exec(content)
+  const title = String(titleTag ? titleTag[1] : heading ? heading[1] : '').trim()
+  const text = content.replace(/<title>[\s\S]*?<\/title>/i, '').trim()
+  return {
+    ok: true,
+    documentId: String(document.document_id ?? ''),
+    revision: Number(document.revision_id ?? 0) || 0,
+    title,
+    text,
+    chars: text.length,
+    tips: String(document.tips ?? ''),
+  }
+}
+
+const DOC_SCOPES = ['full', 'outline', 'keyword']
+
+function safeFilePart(value, fallback = 'doc') {
+  return String(value ?? '').replace(/[^\w.-]/g, '_') || fallback
+}
+
+function docsIndexFile(config) {
+  return join(config.root, 'docs.json')
+}
+
+function docsContentDir(config) {
+  return join(config.root, 'docs')
+}
+
+/** 已拉取过的文档清单（只记来源与标题，不记凭证）。 */
+async function readDocs(config) {
+  try {
+    const parsed = JSON.parse(await readFile(docsIndexFile(config), 'utf8'))
+    const items = Array.isArray(parsed?.items) ? parsed.items : []
+    return items
+      .filter((item) => item && typeof item.id === 'string' && item.id)
+      .map((item) => ({
+        id: String(item.id),
+        title: String(item.title ?? ''),
+        url: String(item.url ?? ''),
+        kind: String(item.kind ?? ''),
+        revision: Number(item.revision ?? 0) || 0,
+        chars: Number(item.chars ?? 0) || 0,
+        addedAt: String(item.addedAt ?? ''),
+      }))
+  } catch {
+    return []
+  }
+}
+
+async function writeDocs(config, items) {
+  await mkdir(dirname(docsIndexFile(config)), { recursive: true })
+  await writeFile(docsIndexFile(config), `${JSON.stringify({ version: 1, updatedAt: new Date().toISOString(), items }, null, 2)}\n`, 'utf8')
+  return items
+}
+
+/** 拉一篇飞书文档：lark-cli docs +fetch -> 正文落盘 + 记进清单。 */
+async function fetchFeishuDoc(config, body) {
+  const input = String(body?.input ?? '').trim()
+  const parsed = parseDocInput(input)
+  if (!parsed.doc) return { ok: false, error: '请粘贴飞书文档链接（/docx/ 或 /wiki/），或直接给文档 token' }
+  const scope = DOC_SCOPES.includes(body?.scope) ? body.scope : 'full'
+  const identity = String(body?.identity ?? '').trim() || config.identity || 'user'
+  const larkCli = await resolveLarkCli(config.larkCli)
+  const wrapper = shellWrapper(larkCli)
+  const args = ['docs', '+fetch', '--doc', parsed.doc, '--doc-format', 'markdown', '--scope', scope, '--as', identity]
+  if (scope === 'keyword' && body?.keyword) args.push('--keyword', String(body.keyword))
+  const command = `lark-cli docs +fetch --doc ${parsed.doc} --doc-format markdown --scope ${scope} --as ${identity}`
+  const result = await runLark(wrapper, args)
+  // 授权/权限类的 JSON 走 stderr，业务成功走 stdout：两边都试一遍再决定报错。
+  const payload = parseDocPayload(result.stdout).ok ? parseDocPayload(result.stdout) : parseDocPayload(result.stderr)
+  if (!payload.ok) {
+    if (!result.ok && /not JSON|没返回可解析/.test(String(payload.error))) {
+      return { ok: false, error: '读取飞书文档失败', detail: (result.stderr || result.stdout || '').trim().slice(0, 1200), command }
+    }
+    return { ok: false, error: payload.error, detail: payload.detail, hint: payload.hint, command }
+  }
+  if (!payload.text) {
+    return { ok: false, error: '这篇文档没读到正文（可能是空文档或没有权限）', command, revision: payload.revision }
+  }
+  const id = payload.documentId || parsed.doc
+  const dir = docsContentDir(config)
+  try {
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, `${safeFilePart(id)}.md`), `${payload.text}\n`, 'utf8')
+  } catch (error) {
+    return { ok: false, error: `文档正文落盘失败：${String(error?.message ?? error)}` }
+  }
+  const item = {
+    id,
+    title: payload.title || input.slice(0, 60),
+    url: parsed.url || input,
+    kind: parsed.kind,
+    revision: payload.revision,
+    chars: payload.chars,
+    addedAt: new Date().toISOString(),
+  }
+  const items = await readDocs(config)
+  const next = [item, ...items.filter((entry) => entry.id !== id)]
+  await writeDocs(config, next)
+  return { ok: true, item, items: next, text: payload.text, chars: payload.chars, revision: payload.revision, scope, command }
+}
+
+async function readDocContent(config, id) {
+  const wanted = String(id ?? '').trim()
+  if (!wanted) return { ok: false, error: '缺少文档 id' }
+  const items = await readDocs(config)
+  const item = items.find((entry) => entry.id === wanted)
+  if (!item) return { ok: false, error: '这篇文档不在已拉取清单里' }
+  const text = await readFile(join(docsContentDir(config), `${safeFilePart(item.id)}.md`), 'utf8').catch(() => null)
+  if (text === null) return { ok: false, error: '正文文件读不到，重新拉取一次即可' }
+  return { ok: true, item, text }
+}
+
+async function removeDoc(config, id) {
+  const wanted = String(id ?? '').trim()
+  const items = await readDocs(config)
+  const next = items.filter((entry) => entry.id !== wanted)
+  await rm(join(docsContentDir(config), `${safeFilePart(wanted)}.md`), { force: true }).catch(() => {})
+  await writeDocs(config, next)
+  return { ok: true, items: next }
+}
+
+/* ----------------------------------------- 专家团全流程（需求→开发→评审→QA） */
+
+/**
+ * 四段固定流程；role 是本机已有的专家角色标识（DSH_HOME/agents/<role>.md）。
+ * needsEvidence：这一段必须能落成凭据，界面上会提示；没凭据也能完成，但会记成 done_unverified。
+ * required：v4.2 恒为 true，等 v4.3 做「阶段可裁剪」时才会真正参与完成度分母。
+ */
+export const FLOW_STAGES = [
+  { id: 'analyze', name: '需求分析', role: 'product-requirement-expert', needsEvidence: true, required: true },
+  { id: 'develop', name: '代码开发', role: 'fullstack-architect', needsEvidence: true, required: true },
+  { id: 'review', name: '代码评审', role: 'code-review-expert', needsEvidence: true, required: true },
+  { id: 'qa', name: 'QA 测试', role: 'qa-test-expert', needsEvidence: true, required: true },
+]
+
+export const FLOW_STATUS = [
+  { id: 'pending', label: '待开始' },
+  { id: 'running', label: '进行中' },
+  { id: 'done', label: '已完成' },
+  { id: 'done_unverified', label: '已完成 · 无凭据' },
+  { id: 'blocked', label: '受阻' },
+]
+
+/**
+ * 凭据的种类。刻意把「备注」排除在外：一句「已完成」不是凭据，一段人写的说明也不是。
+ * 只有命令输出 / 文件清单 / 测试结果 / 链接 / spec 文档路径算。
+ */
+export const FLOW_EVIDENCE_KINDS = [
+  { id: 'command', label: '命令', hint: '跑过的命令 + 输出摘要' },
+  { id: 'files', label: '文件', hint: '改动的文件清单（如 git diff --stat）' },
+  { id: 'test', label: '测试', hint: '用例数 / 通过失败条数' },
+  { id: 'url', label: '链接', hint: 'PR / CI / 构建结果链接' },
+  { id: 'spec', label: '规格', hint: '项目里 skill 产出的 spec 文档路径' },
+]
+
+const FLOW_STATUS_IDS = FLOW_STATUS.map((entry) => entry.id)
+const FLOW_EVIDENCE_KIND_IDS = FLOW_EVIDENCE_KINDS.map((entry) => entry.id)
+const EVIDENCE_MAX_CHARS = 200
+
+export function flowStageName(stageId) {
+  return FLOW_STAGES.find((entry) => entry.id === stageId)?.name ?? String(stageId ?? '')
+}
+
+/** 「已完成 · 无凭据」也推进进度，但它不是有证据的完成 —— 台账里要分开数。 */
+export function isStageDone(stage) {
+  return stage?.status === 'done' || stage?.status === 'done_unverified'
+}
+
+/** 一条流水线的阶段完成度（已完成 / 全部）。 */
+export function flowPercent(flow) {
+  const stages = flow?.stages ?? []
+  if (!stages.length) return 0
+  const done = stages.filter(isStageDone).length
+  return Math.round((done / stages.length) * 100)
+}
+
+/** 台账口径：这条流水线有几条凭据、几个阶段是「无凭据完成」的。 */
+export function flowEvidenceStats(flow) {
+  const stages = flow?.stages ?? []
+  const evidence = stages.reduce((sum, stage) => sum + (Array.isArray(stage.evidence) ? stage.evidence.length : 0), 0)
+  const unverified = stages.filter((stage) => stage.status === 'done_unverified').length
+  const done = stages.filter(isStageDone).length
+  return { evidence, unverified, done, stages: stages.length }
+}
+
+/** 事件流 -> 最新流水线（每个 id 一条，附各阶段状态）。 */
+export function foldFlows(events) {
+  const map = new Map()
+  for (const event of events) {
+    if (!event || typeof event !== 'object' || !event.id) continue
+    if (event.type === 'create') {
+      const ids = (Array.isArray(event.stages) && event.stages.length ? event.stages : FLOW_STAGES.map((stage) => stage.id)).map(String)
+      map.set(String(event.id), {
+        id: String(event.id),
+        at: String(event.at ?? ''),
+        title: String(event.title ?? ''),
+        recordId: String(event.recordId ?? ''),
+        tableKey: String(event.tableKey ?? ''),
+        team: String(event.team ?? ''),
+        teamName: String(event.teamName ?? ''),
+        stages: ids.map((id) => ({ id, status: 'pending', note: '', at: '', evidence: [] })),
+      })
+      continue
+    }
+    const flow = map.get(String(event.id))
+    if (!flow) continue
+    if (event.type === 'stage') {
+      const stage = flow.stages.find((entry) => entry.id === event.stage)
+      if (!stage) continue
+      if (FLOW_STATUS_IDS.includes(event.status)) stage.status = event.status
+      if (event.note !== undefined) stage.note = String(event.note)
+      stage.at = String(event.at ?? '')
+      flow.updatedAt = String(event.at ?? '')
+    }
+    if (event.type === 'evidence') {
+      // 凭据是追加式的：先贴凭据再标完成、或反过来都行。老事件没有 evidence 字段就当没贴。
+      const stage = flow.stages.find((entry) => entry.id === event.stage)
+      if (!stage) continue
+      const kind = FLOW_EVIDENCE_KIND_IDS.includes(event.kind) ? event.kind : 'command'
+      const summary = String(event.summary ?? '').trim().slice(0, EVIDENCE_MAX_CHARS)
+      if (!summary) continue
+      stage.evidence = [
+        ...(stage.evidence ?? []),
+        { kind, summary, ref: String(event.ref ?? '').slice(0, 300), at: String(event.at ?? '') },
+      ]
+      flow.updatedAt = String(event.at ?? '')
+    }
+    if (event.type === 'evidence-remove') {
+      const stage = flow.stages.find((entry) => entry.id === event.stage)
+      if (!stage) continue
+      const targetAt = String(event.targetAt ?? '')
+      stage.evidence = (stage.evidence ?? []).filter((entry) => entry.at !== targetAt)
+      flow.updatedAt = String(event.at ?? '')
+    }
+    if (event.type === 'remove') flow.removed = true
+  }
+  return [...map.values()]
+    .filter((flow) => !flow.removed)
+    .sort((a, b) => String(b.updatedAt ?? b.at).localeCompare(String(a.updatedAt ?? a.at)))
+}
+
+function flowsFile(config) {
+  return join(config.root, 'flows.jsonl')
+}
+
+async function readFlows(config) {
+  const text = await readFile(flowsFile(config), 'utf8').catch(() => '')
+  const events = text
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line)
+      } catch {
+        return null
+      }
+    })
+    .filter(Boolean)
+  return foldFlows(events)
+}
+
+async function appendFlow(config, event) {
+  await mkdir(dirname(flowsFile(config)), { recursive: true })
+  await appendFile(flowsFile(config), `${JSON.stringify(event)}\n`, 'utf8')
+  return event
+}
+
+/* --------------------------------- 项目里的 spec 文档（开发 skill 产出，工作台只认不造） */
+
+/**
+ * spec 不由本工作台生成 —— 它来自项目里的开发 skill 流程（dev-task-sync 的 .dev-tasks/、
+ * OpenSpec 的 openspec/changes/、Spec Kit 的 specs/ 等）。工作台做三件事：
+ * 认出来、允许作为「规格」类凭据引用、对验收标准做一次「能不能失败」的机械检查。
+ */
+const SPEC_DIRS = [
+  { dir: 'specs', label: 'specs/' },
+  { dir: 'openspec/specs', label: 'openspec/specs/' },
+  { dir: 'openspec/changes', label: 'openspec/changes/' },
+  { dir: '.dev-tasks', label: '.dev-tasks/（dev-task-sync 产出）' },
+  { dir: 'doc/specs', label: 'doc/specs/' },
+  { dir: 'docs/specs', label: 'docs/specs/' },
+]
+
+const SPEC_ROOT_PATTERNS = [/\.spec\.md$/i, /^requirements\.md$/i, /^spec\.md$/i]
+const SPEC_MAX_DEPTH = 4
+const SPEC_MAX_FILES = 120
+const SPEC_MAX_BYTES = 200 * 1024
+const SPEC_SKIP_DIRS = new Set(['node_modules', 'dist', 'build', 'coverage', 'target', 'vendor'])
+
+async function collectSpecFiles(rootDir, items, depth = 0) {
+  if (depth > SPEC_MAX_DEPTH || items.length >= SPEC_MAX_FILES) return
+  const entries = await readdir(rootDir, { withFileTypes: true }).catch(() => [])
+  for (const entry of entries) {
+    if (items.length >= SPEC_MAX_FILES) return
+    const name = String(entry.name ?? '')
+    if (!name) continue
+    if (entry.isDirectory()) {
+      if (name.startsWith('.') || SPEC_SKIP_DIRS.has(name)) continue
+      await collectSpecFiles(join(rootDir, name), items, depth + 1)
+      continue
+    }
+    if (!entry.isFile() || !/\.md$/i.test(name)) continue
+    const path = join(rootDir, name)
+    const info = await stat(path).catch(() => null)
+    if (!info || info.size > SPEC_MAX_BYTES) continue
+    if (items.some((item) => resolve(item.path) === resolve(path))) continue
+    items.push({ path, name, bytes: info.size, mtime: info.mtime.toISOString() })
+  }
+}
+
+export async function listSpecFiles(config, settings) {
+  const projectDir = String(settings?.projectDir ?? '').trim()
+  if (!projectDir) {
+    return { ok: false, error: '先在设置里选项目目录，才能扫项目里 skill 产出的 spec 文档', items: [], roots: [] }
+  }
+  const items = []
+  const roots = []
+  for (const entry of SPEC_DIRS) {
+    const dir = join(projectDir, entry.dir)
+    const before = items.length
+    if (existsSync(dir)) {
+      await collectSpecFiles(dir, items)
+      roots.push({ dir: entry.dir, label: entry.label, exists: true, files: items.length - before })
+    } else {
+      roots.push({ dir: entry.dir, label: entry.label, exists: false, files: 0 })
+    }
+  }
+  // 项目根下的 *.spec.md / requirements.md / spec.md（skill 常把 spec 放在根上）
+  const rootEntries = await readdir(projectDir, { withFileTypes: true }).catch(() => [])
+  for (const entry of rootEntries) {
+    if (!entry.isFile()) continue
+    const name = String(entry.name ?? '')
+    if (!SPEC_ROOT_PATTERNS.some((pattern) => pattern.test(name))) continue
+    const path = join(projectDir, name)
+    const info = await stat(path).catch(() => null)
+    if (!info || info.size > SPEC_MAX_BYTES) continue
+    if (items.some((item) => resolve(item.path) === resolve(path))) continue
+    items.push({ path, name, bytes: info.size, mtime: info.mtime.toISOString() })
+  }
+  items.sort((a, b) => String(b.mtime).localeCompare(String(a.mtime)))
+  return { ok: true, projectDir, items, roots }
+}
+
+const ACCEPTANCE_HEADING = /(验收标准|验收条件|验收准则|acceptance\s*criteria|acceptance)/i
+const CONDITION_RULES = [
+  /当[^。；]{1,40}?(时|后)/,
+  /如果/,
+  /假如/,
+  /若[^。；]{1,30}?(则|就)/,
+  /一旦/,
+  /在[^。；]{1,40}?时/,
+  /\bwhen\b/i,
+  /\bgiven\b/i,
+  /\bif\b/i,
+]
+const DECIDABLE_RULES = [
+  /返回/,
+  /拒绝/,
+  /提示/,
+  /显示/,
+  /保存/,
+  /写入/,
+  /跳转/,
+  /抛出/,
+  /不允许/,
+  /禁止/,
+  /失败/,
+  /成功/,
+  /变更为|改为/,
+  /等于|大于|小于/,
+  /不得|必须|应当/,
+  /校验|拦截/,
+  /记录|生成|删除|创建|更新|提交/,
+  /\breturn\b|\breject\b|\bshow\b|\bsave\b|\bwrite\b|\bthrow\b|\bfail\b|\bmust\b|\bshould\b/i,
+]
+const MAX_CRITERION_CHARS = 60
+
+/**
+ * 验收标准的「能不能失败」机械检查（纯规则，不调模型）。
+ * 「注册功能正常工作」无法失败；「当邮箱已注册时，接口返回 409」可以失败 —— 后者在成为代码
+ * 之前就已经是一条测试。只标黄、不阻断：误报的代价是没人再看黄条。
+ */
+export function checkAcceptanceCriteria(text) {
+  const lines = String(text ?? '').split(/\r?\n/)
+  const criteria = []
+  let inSection = false
+  let headingLevel = 0
+  for (const raw of lines) {
+    const line = raw.trim()
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line)
+    if (heading) {
+      const level = heading[1].length
+      if (ACCEPTANCE_HEADING.test(heading[2])) {
+        inSection = true
+        headingLevel = level
+        continue
+      }
+      if (inSection && level <= headingLevel) inSection = false
+      continue
+    }
+    if (!inSection) continue
+    const bullet = /^(?:[-*+]|\d+[.)])\s+(.*)$/.exec(line)
+    if (!bullet) continue
+    const item = bullet[1].trim()
+    if (item) criteria.push(item)
+  }
+  if (!criteria.length) return { found: false, total: 0, weak: [] }
+  const weak = []
+  for (const [index, item] of criteria.entries()) {
+    const reasons = []
+    if (!CONDITION_RULES.some((rule) => rule.test(item))) reasons.push('没有触发条件（当…时 / 如果…）')
+    if (!DECIDABLE_RULES.some((rule) => rule.test(item))) reasons.push('没有可判定的结果（返回 / 拒绝 / 显示…）')
+    const length = [...item].length
+    if (length > MAX_CRITERION_CHARS) reasons.push(`太长（${length} 字 > ${MAX_CRITERION_CHARS} 字，拆成几条）`)
+    if (reasons.length) weak.push({ index: index + 1, text: item.slice(0, 160), reasons })
+  }
+  return { found: true, total: criteria.length, weak }
+}
+
+/* --------------------------------------- 更新日志（包内 CHANGELOG.md） */
+
+/**
+ * 读包自带的 CHANGELOG.md，交给界面「版本号 → 更新日志」弹窗渲染。
+ * 只读包内文件，不接受任何外部路径；文件缺失就返回空，不当成错误。
+ */
+async function readChangelog() {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const candidates = [join(here, '..', 'CHANGELOG.md'), join(here, 'CHANGELOG.md')]
+  for (const file of candidates) {
+    const text = await readFile(file, 'utf8').catch(() => null)
+    if (text === null) continue
+    return { found: true, path: file, text, sections: parseChangelog(text) }
+  }
+  return { found: false, path: '', text: '', sections: [] }
+}
+
+/**
+ * 把 CHANGELOG 拆成 `[{ version, date, items: string[] }]`。
+ * 只认 `## vX.Y.Z — 日期` 形式的标题（兼容 `–`/`-` 破折号），
+ * 正文里以 `- ` 开头的是条目；其它说明性文字丢掉，界面只展示条目。
+ */
+export function parseChangelog(text) {
+  const sections = []
+  let current = null
+  for (const rawLine of String(text ?? '').split(/\r?\n/)) {
+    const line = rawLine.trim()
+    const heading = /^##\s+v?(\d+\.\d+\.\d+)\s*(?:[—–-]+\s*(\d{4}-\d{2}-\d{2}))?/u.exec(line)
+    if (heading) {
+      current = { version: heading[1], date: heading[2] ?? '', items: [] }
+      sections.push(current)
+      continue
+    }
+    if (!current) continue
+    if (/^#{2,}\s/u.test(line)) {
+      current = null
+      continue
+    }
+    const item = /^[-*]\s+(.*)$/u.exec(line)
+    if (item && item[1]) current.items.push(item[1])
+  }
+  return sections.filter((section) => section.items.length > 0)
+}
+
+async function readSpecFile(config, settings, target) {
+  const wanted = String(target ?? '').trim()
+  if (!wanted) return { ok: false, error: '缺少 spec 文件路径' }
+  const listing = await listSpecFiles(config, settings)
+  if (!listing.ok) return { ok: false, error: listing.error }
+  // 白名单：只读扫描结果里的文件，别的一律拒绝（路径由客户端传，不能全信）。
+  const hit = listing.items.find((item) => resolve(item.path) === resolve(wanted))
+  if (!hit) return { ok: false, error: '该路径不在本工作台可读的 spec 范围内（先刷新 spec 扫描）' }
+  const text = await readFile(hit.path, 'utf8').catch((error) => {
+    return `__READ_ERROR__${String(error?.message ?? error)}`
+  })
+  if (text.startsWith('__READ_ERROR__')) return { ok: false, error: text.slice('__READ_ERROR__'.length) }
+  const checks = checkAcceptanceCriteria(text)
+  return {
+    ok: true,
+    path: hit.path,
+    name: hit.name,
+    bytes: hit.bytes,
+    truncated: text.length > 40_000,
+    text: text.length > 40_000 ? `${text.slice(0, 40_000)}\n\n…（已截断，共 ${text.length} 字）` : text,
+    checks,
+  }
+}
+
 /* ------------------------------------------------ 页面内 AI 直接创建（不走对话） */
 
 /** 模型可能把 JSON 包在代码围栏或解释文字里：剥掉围栏、截取最外层大括号再试。 */
@@ -1927,6 +2530,18 @@ export function apply(ctx, config) {
         })
       }
 
+      // 界面自检上报：客户端把「详情分栏的实际布局」报上来，排障时直接读 GET /ui/metrics
+      // 只存在内存里（不落盘、不含任何凭证），进程重启即清空。
+      if (route === '/ui/metrics' && req.method === 'POST') {
+        const body = await readBody(req)
+        uiMetrics = { ...body, at: new Date().toISOString() }
+        return sendJson(res, 200, { ok: true })
+      }
+
+      if (route === '/ui/metrics' && req.method === 'GET') {
+        return sendJson(res, 200, { ok: true, metrics: uiMetrics })
+      }
+
       if (route === '/settings' && req.method === 'POST') {
         const body = await readBody(req)
         const next = { ...body }
@@ -1973,9 +2588,10 @@ export function apply(ctx, config) {
 
       if (route === '/tables' && req.method === 'GET') {
         const settings = await readSettings(config)
-        const { tables } = await listTables(config, settings)
+        const { tables, dropped } = await listTables(config, settings)
         return sendJson(res, 200, {
           projectDir: settings.projectDir,
+          dropped,
           tables: tables.map((table) => ({
             key: table.key,
             label: table.label,
@@ -2028,19 +2644,32 @@ export function apply(ctx, config) {
         const body = await readBody(req)
         const title = String(body?.title ?? '').trim()
         if (!title) return sendJson(res, 400, { error: '缺少需求/任务标题' })
-        const event = {
-          type: 'create',
-          id: `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
-          at: new Date().toISOString(),
-          tableKey: String(body?.tableKey ?? ''),
-          recordId: String(body?.recordId ?? ''),
-          title,
-          projectDir: String(body?.projectDir ?? ''),
-          status: ['handed-off', 'in-progress', 'done', 'blocked'].includes(body?.status) ? body.status : 'handed-off',
-          note: String(body?.note ?? ''),
-        }
+        const tableKey = String(body?.tableKey ?? '')
+        const recordId = String(body?.recordId ?? '')
+        const status = ['handed-off', 'in-progress', 'done', 'blocked'].includes(body?.status) ? body.status : 'handed-off'
+        // 同一个任务只留一条：已经记过就更新那一条（刷新时间/项目/备注、次数 +1），不再追加新的。
+        const existing = (await readRuns(config)).find((run) => runTaskKey(run) === runTaskKey({ tableKey, recordId, title, id: '' }))
+        const event = existing
+          ? { type: 'regenerate', id: existing.id, at: new Date().toISOString(), title, projectDir: String(body?.projectDir ?? ''), note: String(body?.note ?? '') }
+          : {
+              type: 'create',
+              id: `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+              at: new Date().toISOString(),
+              tableKey,
+              recordId,
+              title,
+              projectDir: String(body?.projectDir ?? ''),
+              status,
+              note: String(body?.note ?? ''),
+            }
         await appendRun(config, event)
-        return sendJson(res, 200, { ok: true, run: event, items: await readRuns(config) })
+        const items = await readRuns(config)
+        return sendJson(res, 200, {
+          ok: true,
+          regenerated: Boolean(existing),
+          run: items.find((run) => run.id === (existing ? existing.id : event.id)) ?? event,
+          items,
+        })
       }
 
       if (route === '/runs/status' && req.method === 'POST') {
@@ -2149,6 +2778,151 @@ export function apply(ctx, config) {
         const settings = await readSettings(config)
         const result = await readSkillFile(config, settings, url.searchParams.get('path'))
         return sendJson(res, result.ok ? 200 : 404, result)
+      }
+
+      /* ------------------------------------------- 飞书文档（文档信息） */
+
+      if (route === '/docs' && req.method === 'GET') {
+        return sendJson(res, 200, { items: await readDocs(config) })
+      }
+
+      if (route === '/doc' && req.method === 'GET') {
+        const result = await readDocContent(config, url.searchParams.get('id'))
+        return sendJson(res, result.ok ? 200 : 404, result)
+      }
+
+      if (route === '/doc/fetch' && req.method === 'POST') {
+        const body = await readBody(req)
+        const result = await fetchFeishuDoc(config, body)
+        return sendJson(res, result.ok ? 200 : 502, result)
+      }
+
+      if (route === '/doc/remove' && req.method === 'POST') {
+        const body = await readBody(req)
+        return sendJson(res, 200, await removeDoc(config, body?.id))
+      }
+
+      /* --------------------------------------- 专家团全流程（流水线） */
+
+      if (route === '/flows' && req.method === 'GET') {
+        return sendJson(res, 200, {
+          items: await readFlows(config),
+          stages: FLOW_STAGES,
+          statuses: FLOW_STATUS,
+          evidenceKinds: FLOW_EVIDENCE_KINDS,
+        })
+      }
+
+      if (route === '/flows' && req.method === 'POST') {
+        const body = await readBody(req)
+        const title = String(body?.title ?? '').trim()
+        if (!title) return sendJson(res, 400, { error: '缺一条任务/需求，先选一条再开始全流程' })
+        const team = String(body?.team ?? '').trim()
+        const stages = (Array.isArray(body?.stages) && body.stages.length ? body.stages : FLOW_STAGES.map((stage) => stage.id)).map(String)
+        const event = {
+          type: 'create',
+          id: `flow-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+          at: new Date().toISOString(),
+          recordId: String(body?.recordId ?? ''),
+          tableKey: String(body?.tableKey ?? ''),
+          title,
+          team,
+          teamName: String(body?.teamName ?? ''),
+          stages,
+        }
+        await appendFlow(config, event)
+        return sendJson(res, 200, { ok: true, flow: event, items: await readFlows(config) })
+      }
+
+      if (route === '/flows/stage' && req.method === 'POST') {
+        const body = await readBody(req)
+        const id = String(body?.id ?? '').trim()
+        const stage = String(body?.stage ?? '').trim()
+        const status = String(body?.status ?? '').trim()
+        if (!id || !stage) return sendJson(res, 400, { error: '缺少流水线 id 或阶段 id' })
+        if (status && !FLOW_STATUS_IDS.includes(status)) return sendJson(res, 400, { error: `阶段状态不合法：${status}` })
+        // 不变式：done 必然有凭据。前端漏判时这里兜底降级，免得台账里出现「没凭据的已完成」。
+        let nextStatus = status
+        if (status === 'done') {
+          const current = (await readFlows(config)).find((flow) => flow.id === id)
+          const target = current?.stages.find((entry) => entry.id === stage)
+          if (!(target?.evidence?.length)) nextStatus = 'done_unverified'
+        }
+        await appendFlow(config, {
+          type: 'stage',
+          id,
+          at: new Date().toISOString(),
+          stage,
+          status: nextStatus || undefined,
+          note: body?.note === undefined ? undefined : String(body.note),
+        })
+        return sendJson(res, 200, { ok: true, downgraded: nextStatus !== status, items: await readFlows(config) })
+      }
+
+      if (route === '/flows/evidence' && req.method === 'POST') {
+        const body = await readBody(req)
+        const id = String(body?.id ?? '').trim()
+        const stage = String(body?.stage ?? '').trim()
+        const kind = String(body?.kind ?? '').trim() || 'command'
+        const summary = String(body?.summary ?? '').trim()
+        if (!id || !stage) return sendJson(res, 400, { error: '缺少流水线 id 或阶段 id' })
+        if (!FLOW_EVIDENCE_KIND_IDS.includes(kind)) return sendJson(res, 400, { error: `凭据类型不合法：${kind}` })
+        if (!summary) {
+          return sendJson(res, 400, {
+            error: '凭据不能为空：一句「已完成」不算凭据，写清楚改了什么 / 跑了什么命令 / 结果如何',
+          })
+        }
+        await appendFlow(config, {
+          type: 'evidence',
+          id,
+          at: new Date().toISOString(),
+          stage,
+          kind,
+          summary: summary.slice(0, EVIDENCE_MAX_CHARS),
+          ref: String(body?.ref ?? '').slice(0, 300),
+        })
+        return sendJson(res, 200, { ok: true, items: await readFlows(config) })
+      }
+
+      if (route === '/flows/evidence/remove' && req.method === 'POST') {
+        const body = await readBody(req)
+        const id = String(body?.id ?? '').trim()
+        const stage = String(body?.stage ?? '').trim()
+        const targetAt = String(body?.at ?? '').trim()
+        if (!id || !stage || !targetAt) return sendJson(res, 400, { error: '缺少流水线 id、阶段 id 或凭据时间' })
+        await appendFlow(config, { type: 'evidence-remove', id, at: new Date().toISOString(), stage, targetAt })
+        return sendJson(res, 200, { ok: true, items: await readFlows(config) })
+      }
+
+      if (route === '/flows/remove' && req.method === 'POST') {
+        const body = await readBody(req)
+        const id = String(body?.id ?? '').trim()
+        if (!id) return sendJson(res, 400, { error: '缺少流水线 id' })
+        await appendFlow(config, { type: 'remove', id, at: new Date().toISOString() })
+        return sendJson(res, 200, { ok: true, items: await readFlows(config) })
+      }
+
+      /* --------------------------------------- 项目里 skill 产出的 spec 文档 */
+
+      if (route === '/spec-scan' && req.method === 'GET') {
+        const settings = await readSettings(config)
+        const listing = await listSpecFiles(config, settings)
+        return sendJson(res, 200, listing)
+      }
+
+      if (route === '/spec-read' && req.method === 'POST') {
+        const body = await readBody(req)
+        const settings = await readSettings(config)
+        const target = String(body?.path ?? '').trim()
+        if (!target) return sendJson(res, 400, { error: '缺少 spec 文件路径' })
+        const result = await readSpecFile(config, settings, target)
+        return sendJson(res, result.ok ? 200 : 400, result)
+      }
+
+      /* --------------------------------------- 更新日志（包内 CHANGELOG.md） */
+
+      if (route === '/changelog' && req.method === 'GET') {
+        return sendJson(res, 200, await readChangelog())
       }
 
       return sendJson(res, 404, { error: `未知接口 ${route}` })

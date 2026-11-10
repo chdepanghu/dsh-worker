@@ -1,5 +1,5 @@
-# 需求开发工作台：把本包的服务端入口插入 Harness 插件树。
-# 业务数据（工作台设置）写在 DSH 数据目录下的 requirement-dev-workbench/。
+# AI Native 工作台（包名沿用 dsh-requirement-dev-workbench）：把本包的服务端入口插入 Harness 插件树。
+# 业务数据（工作台设置、飞书文档正文、全流程记录）写在 DSH 数据目录下的 requirement-dev-workbench/。
 - insert:
     - id: requirement-dev-workbench
       name: dsh-requirement-dev-workbench
